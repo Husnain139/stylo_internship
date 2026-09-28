@@ -1,10 +1,10 @@
-# Turn a question into a SQL query on the Gold warehouse, run it,
-# then answer from those rows.
+# Turn a question into a SQL query on the Gold warehouse, then run it.
 #   python ask_nlp.py "What was total revenue in 2020?"
 
 #-- read the question from the command line --
 import sys
-question = " ".join(sys.argv[1:]).strip()
+as_json = "--json" in sys.argv[1:] #sys.argv = ["ask_nlp.py", "What was total revenue in 2020?", "--json"]
+question = " ".join(arg for arg in sys.argv[1:] if arg != "--json").strip()
 if not question:
     raise SystemExit('Usage: python ask_nlp.py "your question"')
 
@@ -26,13 +26,6 @@ if not api_key:
     raise SystemExit("Set GOOGLE_API_KEY in .env")
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
 
-sql_question = (
-    "Write one T-SQL SELECT that answers this question. "
-    "Use only the tables and columns in the context. "
-    "Include TOP 50 unless the question asks for one number. "
-    "Return only the SQL.\n"
-    + question
-)
 SCHEMA = """
 dbo.dimcustomer_gold(CustomerID bigint, CustomerName varchar, Email varchar, First varchar, Last varchar)
 dbo.dimdate_gold(OrderDate date, Day int, Month int, Year int, mmmyyyy varchar, yyyymm varchar)
@@ -46,25 +39,19 @@ dbo.revenue_weekly_gold(PeriodStart date, PeriodEnd date, ActualRevenue float, A
 Revenue on a sale line is Quantity * UnitPrice + Tax.
 Join factsales_gold to dimcustomer_gold on CustomerID, to dimproduct_gold on ItemID, and to dimdate_gold on OrderDate.
 """
-PROMPT = """You are an AI assistant that answers questions ONLY using the provided context.
-
-Rules:
-1. Answer only from the provided context.
-2. If the answer is not in the context, say: "I couldn't find that information in the context."
-3. Do not make up facts.
-4. Be clear and concise.
-5. If the question asks you to write a SQL query, return one T-SQL SELECT and nothing else.
-6. If the context is a table of query results, those rows are the answer. State the numbers from the rows.
+PROMPT = """Write one T-SQL SELECT that answers the question.
+Use only the tables and columns in the context.
+Include TOP 50 unless the question asks for one number.
+Give every selected expression an alias.
+Return only the SQL, with no explanation.
 
 Context:
 {context}
 
 Question:
 {question}
-
-Answer:
 """
-sql = llm.invoke(PROMPT.format(context=SCHEMA, question=sql_question)).content.strip()
+sql = llm.invoke(PROMPT.format(context=SCHEMA, question=question)).content.strip()
 if sql.startswith("```"):
     lines = sql.splitlines() #.splitlines() splits the string into a list of lines, removing the newline characters.
     lines = lines[1:] #drops the first line, which is the opening ```sql of the code block.
@@ -80,7 +67,27 @@ import struct
 import pyodbc
 from azure.identity import AzureCliCredential
 
-token = AzureCliCredential().get_token("https://database.windows.net/.default").token
+try:
+    token = AzureCliCredential().get_token("https://database.windows.net/.default").token
+except Exception:
+    # az.cmd fails when a proxy inspects TLS. The CLI's own Python can use the OS trust store.
+    import subprocess
+    cli_python = r"C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe"
+    site = os.path.dirname(os.path.dirname(truststore.__file__))
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {site!r})\n"
+        "import truststore\n"
+        "truststore.inject_into_ssl()\n"
+        "from azure.cli.core import get_default_cli\n"
+        "raise SystemExit(get_default_cli().invoke(["
+        "'account','get-access-token','--resource','https://database.windows.net','-o','json']))\n"
+    )
+    proc = subprocess.run([cli_python, "-c", script], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr or proc.stdout)
+    import json
+    token = json.loads(proc.stdout)["accessToken"]
 encoded = token.encode("utf-16-le")
 token_struct = struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
 SQL_SERVER = (
@@ -101,14 +108,17 @@ try:
 finally:
     conn.close()
 
-if not fetched:
-    context = "The query returned no rows.\n" + sql
+rows = [["" if value is None else str(value) for value in row] for row in fetched]
+if as_json:
+    import json
+    print("---JSON---")
+    print(json.dumps({"columns": columns, "rows": rows, "sql": sql}))
 else:
-    lines = [" | ".join(columns)] #e.g "CustomerID | CustomerName | Email | First | Last"
-    for row in fetched:
-        lines.append(" | ".join("" if value is None else str(value) for value in row)) #e.g "1 | John Doe | john.doe@example.com | John | Doe"
-    context = "Query results:\n" + "\n".join(lines)
-
-print(llm.invoke(PROMPT.format(context=context, question=question)).content)
-print("\nSQL:")
-print(sql)
+    if not rows:
+        print("The query returned no rows.")
+    else:
+        print(" | ".join(columns))
+        for row in rows:
+            print(" | ".join(row))
+    print("\nSQL:")
+    print(sql)

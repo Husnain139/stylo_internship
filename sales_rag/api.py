@@ -49,11 +49,19 @@ from fastapi import FastAPI, HTTPException
 '''
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel #defines and validates the expected request body.
-import json
-import subprocess #runs ask_nlp.py as a separate process.
-import sys
+import ask_nlp
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_app):
+    # Open Gold once, while the server is starting, so the first question does not pay for login.
+    try:
+        ask_nlp.query_gold("SELECT 1 AS ok")
+    except Exception:
+        pass
+    yield
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, #Cross-Origin Resource Sharing Postman
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -70,17 +78,8 @@ def ask(body: AskBody):
     if not question:
         raise HTTPException(status_code=400, detail="Enter a question.")
 
-    proc = subprocess.run(
-        [sys.executable, "ask_nlp.py", "--json", question], #It uses the same Python interpreter that is currently running FastAPI. 
-        capture_output=True, #Don't directly display the subprocess's output in the terminal. Capture it so Python can inspect it. stored in proc.stdout and proc.stderr.
-        text=True, #Python gives you strings rather than raw bytes as output. This is important for text processing and avoids the need for manual decoding.
-    )
-    marker = "---JSON---" #len(marker) = 10
-    index = proc.stdout.rfind(marker) # Find the index of the JSON marker in the output.
-    if proc.returncode != 0 or index == -1:
-        detail = (proc.stderr or proc.stdout or "The query failed.").strip()
-        raise HTTPException(status_code=500, detail=detail) #why 500? Because the error is on the server side, not the client side. The client sent a valid request, but the server failed to process it correctly.
     try:
-        return json.loads(proc.stdout[index + len(marker):]) # Extract the JSON part from the subprocess output.
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="The script did not return JSON.")
+        return ask_nlp.run(question)
+    except SystemExit as exc:
+        detail = exc.code if isinstance(exc.code, str) else "The query failed."
+        raise HTTPException(status_code=500, detail=detail)

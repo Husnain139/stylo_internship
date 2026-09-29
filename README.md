@@ -8,7 +8,7 @@ Each project lives in its own folder with its own notebooks, data (where applica
 
 | Project | Path | One-liner |
 |---|---|---|
-| **Sales predictor** | [`sales_predictor/`](sales_predictor/) | Microsoft Fabric / OneLake revenue forecasting from `Gold.dbo.factsales_gold` (multi-model notebook plus a simpler linear + Prophet notebook). |
+| **Sales predictor** | [`sales_predictor/`](sales_predictor/) | Microsoft Fabric / OneLake revenue forecasting from `Gold.dbo.factsales_gold`. |
 | **Solar predictor** | [`solar_predictor/`](solar_predictor/) | Predicts solar plant inverter **AC power** from Plant 1 generation and weather sensor CSVs (EDA, cleaning, features, scaled linear regression). |
 | **Solar RAG** | [`solar_rag/`](solar_rag/) | RAG over PDFs (LangChain + Gemini). The chunk table is stored in the SolarRAG Fabric lakehouse. |
 | **Sales RAG** | [`sales_rag/`](sales_rag/) | Question over the Gold warehouse: one prompt turns the question into SQL, then answers from the result rows. |
@@ -17,8 +17,7 @@ Each project lives in its own folder with its own notebooks, data (where applica
 
 Forecasts daily / weekly / monthly sales revenue against a Fabric Gold lakehouse.
 
-- **`Revenue_Forecast_Notebook.ipynb`** — main notebook: reads live `factsales_gold`, benchmarks candidate models (and blends), picks a champion, writes forecast / backtest / history tables, logs to MLflow. Runs on Fabric Spark or locally against OneLake.
-- **`revenue_forecast.ipynb`** — earlier notebook: load Gold fact sales, preprocess, linear regression and Prophet-style forecasting / visualization.
+- **`Revenue_Forecast_Notebook.ipynb`** — reads live `factsales_gold`, benchmarks candidate models (and blends), picks a champion, writes forecast / backtest / history tables, logs to MLflow. The log-growth linear model, Prophet settings, horizon check, and the Prophet-plus-lag fade (50/50 in week 1, lag weight 0 from week 5) live here. Runs on Fabric Spark or locally against OneLake.
 - **`README_VSCode.md`** — how to run the Fabric notebook from VS Code (Fabric runtime vs local Python kernel).
 - **`requirements-local.txt`** — Python deps for local runs of `Revenue_Forecast_Notebook.ipynb`.
 - **`Revenue_Forecasting_Manual.pdf`** — forecasting manual for models and outputs.

@@ -269,7 +269,6 @@ from sklearn.linear_model import Ridge # performs linear least squares regressio
 from lightgbm import LGBMRegressor # used for tree based non linear model, later we will compare it with linear models
 from sklearn.linear_model import LinearRegression # plain OLS = Ridge with alpha 0 (no shrinkage); comparing it with ridge_lags shows what the L2 penalty buys on ~100 rows
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor # bagged trees / scikit-learn's own gradient boosting (exact greedy splits, unlike LightGBM's histogram binning)
-from sklearn.metrics import r2_score, precision_score, recall_score, f1_score, confusion_matrix # R2 for the regression, the rest for the direction-of-change classification (see score())
 # XGBoost and CatBoost are optional: the first cell installs them, but if that is disabled (pipeline without inline installation) the notebook still runs without them.
 try:
     from xgboost import XGBRegressor
@@ -390,8 +389,14 @@ def make_ml(estimator_factory):
         logy = np.log1p(weekly_bins(series)) #calculate log-transformed weekly revenue as we are interested in relative growth, rather than raw revenue differences.
         X, g = ml_features(logy) #see above function
         mask = X.notna().all(axis=1) & g.notna() #Keep only rows where all required features and the target actually exist.
-        pipe = Pipeline([("scale", StandardScaler()), ("model", estimator_factory())])
-        pipe.fit(X[mask], g[mask])
+        # Scale on the full weekly table first, then fit the estimator on this training slice only.
+        logy_all = np.log1p(weekly_bins(daily))
+        X_all, g_all = ml_features(logy_all)
+        mask_all = X_all.notna().all(axis=1) & g_all.notna()
+        scaler = StandardScaler().fit(X_all[mask_all])
+        model = estimator_factory()
+        model.fit(scaler.transform(X[mask]), g[mask])
+        pipe = Pipeline([("scale", scaler), ("model", model)])
         return {"pipe": pipe, "logy": logy, "hstd": horizon_log_std(np.expm1(logy))} #pipe = The trained Ridge/LightGBM model, logy = historical log revenue, hstd = Historical uncertainty information.
     def predict(model, start, horizon):
         logy, pipe = model["logy"].copy(), model["pipe"] #logy → historical log revenue; pipe → trained ML model
@@ -452,10 +457,13 @@ if CatBoostRegressor is not None:
                                                                     verbose=0,
                                                                     allow_writing_files=False))  # no catboost_info/ folder on the driver / in the repo
 
-# ---- blends = plain average of the components' daily forecasts (point, lower and upper) ----------------------------------
+# ---- blends ---------------------------------------------------------------------------------------------------------------
+# Prophet + exactly one *_lags model: week 1 is 50/50, the lag weight fades to 0 by week 5, then Prophet only.
+# Every other blend is an equal average of the components' daily forecasts (point, lower and upper).
 BLENDS = {
     "prophet_holt_blend":          ["prophet", "holt_damped"],
     "prophet_ridge_blend":         ["prophet", "ridge_lags"],
+    "prophet_linreg_blend":        ["prophet", "linreg_lags"],
     "prophet_holt_ridge_blend":    ["prophet", "holt_damped", "ridge_lags"],
     # Prophet (trend + yearly seasonality) paired with each tree learner, like prophet_ridge_blend
     "prophet_rf_blend":            ["prophet", "random_forest_lags"],
@@ -478,46 +486,134 @@ for name, comps in BLENDS.items():                    # ... plus every blend who
         CANDIDATES[name] = comps
 print(f"{len(COMPONENTS)} components + {len(CANDIDATES) - len(COMPONENTS)} blends = {len(CANDIDATES)} candidates")
 
-def blend(component_preds, names): #component_preds = predictions from models, names = names of models to be blended together
-    return sum(component_preds[n] for n in names) / len(names) # predicted value1 + predicted value2 + ... n / n
+def uses_horizon_fade(names):
+    # Prophet plus one recursive lag model. The 90-day forecast fades that lag model.
+    lag_names = [n for n in names if n.endswith("_lags")]
+    return len(names) == 2 and "prophet" in names and len(lag_names) == 1
+
+def blend(component_preds, names):
+    # Equal average. This is what the rolling 3-month back-test scores.
+    return sum(component_preds[n] for n in names) / len(names)
+
+def forward_blend(component_preds, names):
+    # Shipped forecast only. Week 1 is 50/50, then the lag weight steps down and is 0 from week 5.
+    if not uses_horizon_fade(names):
+        return blend(component_preds, names)
+    lag_name = next(n for n in names if n.endswith("_lags"))
+    prophet = component_preds["prophet"]
+    lag = component_preds[lag_name].reindex(prophet.index)
+    weeks_ahead = (prophet.index - prophet.index.min()).days.to_numpy() // 7 + 1
+    lag_weight = np.clip(1 - (weeks_ahead - 1) / 4.0, 0, 1) * 0.5
+    mixed = lag_weight.reshape(-1, 1) * lag.to_numpy(dtype=float) + (1 - lag_weight.reshape(-1, 1)) * prophet.to_numpy(dtype=float)
+    return pd.DataFrame(mixed, index=prophet.index, columns=prophet.columns).clip(lower=0.0)
 
 
-def score(actual, forecast, prev=None):
+def score(actual, forecast):
     # actual/forecast: per-period revenue over the back-test horizon (weekly bins or months).
-    # prev: revenue of the period right BEFORE the first one (last training week/month) -> gives period 1 a reference for the direction metrics.
     a, f = np.asarray(actual, float), np.asarray(forecast, float) #a = actual, f = forecasted/predicted
     err = f - a #difference
-    wape = 100 * np.sum(np.abs(err)) / max(np.sum(np.abs(a)), 1e-9) #Weighted 'Absolute Percentage Error', totaL error percentage, 1e-9 prevents division by zero, sum of abs errors/sum of actuals
-    out = {"MAE":  float(np.mean(np.abs(err))), #mean 'absolute error'
-           "RMSE": float(np.sqrt(np.mean(err ** 2))), #root mean 'squared error'
-           "MAPE": float(100 * np.mean(np.abs(err) / np.maximum(np.abs(a), 1e-9))), #mean 'abosulte percentage error'
-           "sMAPE": float(100 * np.mean(2 * np.abs(err) / np.maximum(np.abs(a) + np.abs(f), 1e-9))), #Symmetric Mean Absolute Percentage Error, 
-           "WAPE": float(wape),
-           "AccuracyPct": float(max(0.0, 100 - wape)), #accuracy percentage, The baseline business health score.
-           "BiasPct": float(100 * np.sum(err) / max(np.sum(a), 1e-9))} #bias percentage, Directional skew. Are we over-predicting or under-predicting in total?
+    wape = 100 * np.sum(np.abs(err)) / max(np.sum(np.abs(a)), 1e-9) #Weighted Absolute Percentage Error
+    return {"MAE":  float(np.mean(np.abs(err))), #mean absolute error
+            "RMSE": float(np.sqrt(np.mean(err ** 2))), #root mean squared error
+            "MAPE": float(100 * np.mean(np.abs(err) / np.maximum(np.abs(a), 1e-9))), #mean absolute percentage error
+            "sMAPE": float(100 * np.mean(2 * np.abs(err) / np.maximum(np.abs(a) + np.abs(f), 1e-9))), #symmetric mean absolute percentage error; champion criterion
+            "WAPE": float(wape),
+            "AccuracyPct": float(max(0.0, 100 - wape)), #100 - WAPE, the accuracy number to quote
+            "BiasPct": float(100 * np.sum(err) / max(np.sum(a), 1e-9))} #negative = under-forecast
 
-    # R2 = 1 - SSE/SST: share of the period-to-period variance of the actuals that the forecast explains. 1 = perfect, 0 = no better than
-    # predicting the horizon's own mean, negative = worse than that. Needs >= 2 periods; with only 3 monthly points per fold it is unstable, read the weekly value.
-    out["R2"] = float(r2_score(a, f)) if len(a) >= 2 and np.ptp(a) > 0 else float("nan")
+# METADATA ********************
 
-    # ---- classification view: precision / recall / F1 / confusion matrix need a class label, and a revenue forecast has none. ----
-    # The one binary event a forecast implies is the DIRECTION of change: did revenue go UP versus the previous period (positive class) or not?
-    # Comparing the model's predicted direction with what really happened tells whether it gets the turning points right, regardless of the size of the error.
-    # A flat weekly forecast (naive, moving average) can only call "up" for period 1 (its level vs. the last training week); after that it never
-    # predicts a rise, so its weekly precision/recall/F1 are ~0 by construction. At the monthly grain the month lengths (28/30/31 days) give it a spurious direction.
-    if prev is not None:
-        a_up = np.r_[a[0] > prev, a[1:] > a[:-1]]   # what actually happened, period by period
-        f_up = np.r_[f[0] > prev, f[1:] > f[:-1]]   # what the model said would happen
-        tn, fp, fn, tp = confusion_matrix(a_up, f_up, labels=[False, True]).ravel()
-        out.update({"DirAccuracyPct": float(100 * (tp + tn) / len(a)),                    # share of periods whose direction was called correctly
-                    "DirPrecision": float(precision_score(a_up, f_up, zero_division=0)),   # of the periods the model called "up", how many really went up
-                    "DirRecall":    float(recall_score(a_up, f_up, zero_division=0)),      # of the periods that really went up, how many the model caught
-                    "DirF1":        float(f1_score(a_up, f_up, zero_division=0)),          # harmonic mean of precision and recall
-                    "TP": int(tp), "FP": int(fp), "TN": int(tn), "FN": int(fn)})           # the 2x2 confusion matrix, one cell per column (summed over folds later)
-    else:
-        out.update({"DirAccuracyPct": float("nan"), "DirPrecision": float("nan"), "DirRecall": float("nan"), "DirF1": float("nan"),
-                    "TP": 0, "FP": 0, "TN": 0, "FN": 0})
-    return out
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
+
+# Rolling check for linreg_lags. One-step fit uses last week's actual revenue.
+# A 90-day forecast does not, so this rolls the fitted model forward and scores 1, 4, 8, and 13 weeks ahead.
+# sMAPE rising with the horizon is why Prophet + one lag model fades the lag weight to 0 by week 5.
+
+def linreg_horizon_table(series, horizons=(1, 4, 8, 13), test_frac=0.2):
+    weekly = weekly_bins(series)
+    logy_all = np.log1p(weekly)
+    X_all, g_all = ml_features(logy_all)
+    usable = logy_all.index[X_all.notna().all(axis=1) & g_all.notna()]
+    cut = int(len(usable) * (1 - test_frac))
+    train_end = usable[cut - 1]
+    pipe = COMPONENTS["linreg_lags"][0](series.loc[:train_end])["pipe"]
+    pos = {ts: i for i, ts in enumerate(weekly.index)}
+    scores = {h: [] for h in horizons}
+    for origin_ts in usable[cut:]:
+        origin = pos[origin_ts]
+        hist = logy_all.iloc[:origin].copy()
+        for step in range(1, max(horizons) + 1):
+            target_pos = origin - 1 + step
+            if target_pos >= len(weekly):
+                break
+            hist.loc[weekly.index[target_pos]] = np.nan
+            X_row, _ = ml_features(hist)
+            hist.iloc[-1] = hist.iloc[-2] + float(pipe.predict(X_row.iloc[[-1]])[0])
+            if step in scores:
+                scores[step].append((float(weekly.iloc[target_pos]), float(np.expm1(hist.iloc[-1]))))
+    return scores
+
+horizon_scores = linreg_horizon_table(daily)
+print("linreg_lags rolling horizon (scaler fit on the full weekly table, model fit on the early weeks)")
+print("weeks ahead    n   sMAPE")
+for step, pairs in horizon_scores.items():
+    actual_h = np.array([pair[0] for pair in pairs])
+    pred_h = np.array([pair[1] for pair in pairs])
+    smape = 100 * np.mean(2 * np.abs(pred_h - actual_h) / np.maximum(np.abs(actual_h) + np.abs(pred_h), 1e-9))
+    print(f"{step:12} {len(actual_h):4} {smape:8.1f}")
+
+fade_weeks = np.arange(1, 14)
+lag_weight = np.clip(1 - (fade_weeks - 1) / 4.0, 0, 1) * 0.5
+print("\nProphet + one lag model, lag weight by forecast week:")
+print(np.round(lag_weight, 2))
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
+
+# Holdout: one-step linear + Prophet, 50/50, last 20% of weeks. Reports sMAPE and accuracy.
+
+weekly = weekly_bins(daily)
+logy = np.log1p(weekly)
+X, growth = ml_features(logy)
+usable = X.notna().all(axis=1) & growth.notna()
+X, growth, y = X[usable], growth[usable], weekly[usable]
+cut = int(len(X) * 0.8)
+
+# Scale the full weekly table, then split. The linear model is fit on the early rows only.
+feature_scaler = StandardScaler().fit(X)
+X_scaled = pd.DataFrame(feature_scaler.transform(X), index=X.index, columns=X.columns)
+holdout_model = LinearRegression().fit(X_scaled.iloc[:cut], growth.iloc[:cut])
+growth_hat = holdout_model.predict(X_scaled.iloc[cut:])
+linear_holdout = np.expm1(logy.shift(1).reindex(y.index[cut:]).to_numpy() + growth_hat)
+
+prophet_holdout_model = Prophet(**PROPHET_PARAMS)
+prophet_holdout_model.fit(pd.DataFrame({"ds": y.index[:cut], "y": y.iloc[:cut].to_numpy()}))
+prophet_holdout = prophet_holdout_model.predict(pd.DataFrame({"ds": y.index[cut:]}))["yhat"].clip(lower=0).to_numpy()
+
+blend_holdout = (linear_holdout + prophet_holdout) / 2
+blend_actual = y.iloc[cut:].to_numpy()
+
+def period_scores(actual, pred):
+    err = pred - actual
+    smape = 100 * np.mean(2 * np.abs(err) / np.maximum(np.abs(actual) + np.abs(pred), 1e-9))
+    wape = 100 * np.sum(np.abs(err)) / max(np.sum(np.abs(actual)), 1e-9)
+    return smape, max(0.0, 100 - wape)
+
+for name, pred in (("one-step linear", linear_holdout), ("Prophet", prophet_holdout), ("50/50 blend", blend_holdout)):
+    smape, accuracy = period_scores(blend_actual, pred)
+    print(f"{name}: sMAPE {smape:.1f}%   accuracy {accuracy:.1f}%")
+
 
 # METADATA ********************
 
@@ -558,58 +654,39 @@ for fold, cutoff in enumerate(cutoffs, start=1):
         print(f"fold {fold} | train to {cutoff.date()} | {comp:<16} {time.time() - t0:5.1f}s") #print the fold number, cutoff date, component model name, and the time taken to fit and predict for the current component model
 
     actual_w, actual_m = weekly_bins(actual), actual.resample("MS").sum() #actual_w = actual data resampled to weekly bins, actual_m = actual data resampled to monthly bins, So now we can evaluate forecasts at two different grains
-    # revenue of the period right before the first evaluated period = reference for the direction (up/down) of period 1 (weekly bins are labelled by their last day)
-    prev_w = float(daily.loc[actual_w.index[0] - pd.Timedelta(days=13): actual_w.index[0] - pd.Timedelta(days=7)].sum())  # the 7 days before the first complete weekly bin
-    prev_m = float(daily.loc[cutoff + pd.offsets.MonthBegin(-1): cutoff].sum())                                            # the cutoff month (last training month)
     for cand, comps in CANDIDATES.items(): #from 'CANDIDATES'.
         fc = blend(preds, comps)["yhat"] #blend the predictions from the component models for the current candidate model, and store the blended predictions in fc
-        for grain, a, f, prev in (("weekly", actual_w, weekly_bins(fc), prev_w), ("monthly", actual_m, fc.resample("MS").sum(), prev_m)):
+        for grain, a, f in (("weekly", actual_w, weekly_bins(fc)), ("monthly", actual_m, fc.resample("MS").sum())):
             rows.append({"Model": cand, "Fold": fold, "CutoffDate": cutoff.date(), "HorizonEnd": horizon_end.date(),
-                         "Grain": grain, "Periods": len(a), **score(a.values, f.values, prev=prev)})
+                         "Grain": grain, "Periods": len(a), **score(a.values, f.values)})
 
 backtest = pd.DataFrame(rows)
-ERROR_METRICS     = ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE", "AccuracyPct", "BiasPct"]
-DIRECTION_METRICS = ["R2", "DirAccuracyPct", "DirPrecision", "DirRecall", "DirF1"]   # averaged over folds like the error metrics
-CM_CELLS          = ["TP", "FP", "TN", "FN"]                                          # confusion-matrix cells: summed over folds (counts, not rates)
-METRICS = ERROR_METRICS + DIRECTION_METRICS
-leaderboard = (backtest.groupby(["Grain", "Model"])[METRICS].mean()
+ERROR_METRICS = ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE", "AccuracyPct", "BiasPct"]
+leaderboard = (backtest.groupby(["Grain", "Model"])[ERROR_METRICS].mean()
                        .unstack("Grain").swaplevel(axis=1).sort_index(axis=1))
-leaderboard = leaderboard.sort_values(("weekly", "sMAPE"))   # champion criterion unchanged: weekly sMAPE
-confusion = backtest.groupby(["Grain", "Model"])[CM_CELLS].sum()   # pooled 2x2 confusion matrix per model and grain
+leaderboard = leaderboard.sort_values(("weekly", "sMAPE"))   # champion = lowest weekly sMAPE
 CHAMPION = leaderboard.index[0]
 backtest["IsChampion"] = backtest["Model"].eq(CHAMPION)
-
-def confusion_table(model, grain):
-    # the pooled confusion matrix as a 2x2 table: rows = what actually happened, columns = what the model predicted
-    c = confusion.loc[(grain, model)]
-    return pd.DataFrame([[c["TP"], c["FN"]], [c["FP"], c["TN"]]],
-                        index=["actual UP", "actual DOWN"], columns=["predicted UP", "predicted DOWN"])
 
 pd.set_option("display.width", 220)
 for grain in ("weekly", "monthly"):
     print(f"\n=== Benchmark: average over folds ({grain} grain) ===")
     print(leaderboard[grain][ERROR_METRICS].round(1).to_string())
-    print(f"\n=== R2 + direction-of-change classification, {grain} grain (positive class = revenue UP vs previous {grain[:-2]}; TP/FP/TN/FN pooled over {BACKTEST_FOLDS} folds) ===")
-    print(leaderboard[grain][DIRECTION_METRICS].round(2).join(confusion.loc[grain]).to_string())
 print(f"\nChampion: {CHAMPION}")
-for grain in ("weekly", "monthly"):
-    print(f"\nConfusion matrix of the champion, {grain} grain, {BACKTEST_FOLDS} folds pooled:")
-    print(confusion_table(CHAMPION, grain).to_string())
 
 # one MLflow run per candidate so the benchmark is visible in the experiment
 for cand, comps in CANDIDATES.items():
     with mlflow.start_run(run_name=f"backtest_{cand}"):
         mlflow.log_params({"model": cand, "components": "+".join(comps), "backtest_folds": BACKTEST_FOLDS,
                            "backtest_horizon_months": BACKTEST_HORIZON_MONTHS, "include_tax": INCLUDE_TAX,
+                           "blend_weights": "equal_average",
                            **({f"prophet_{k}": v for k, v in PROPHET_PARAMS.items()} if "prophet" in comps else {}),
                            **({"features": ",".join(ML_FEATURE_NAMES), "scaler": "StandardScaler", "target": "weekly log-growth"}
                               if any(c.endswith("_lags") for c in comps) else {})})
         for grain in ("weekly", "monthly"):
-            mlflow.log_metrics({f"{grain}_{m}": float(v) for m, v in leaderboard.loc[cand, grain].items() if pd.notna(v)})   # R2 can be NaN
-            mlflow.log_metrics({f"{grain}_{c}": float(v) for c, v in confusion.loc[(grain, cand)].items()})                   # pooled TP/FP/TN/FN
+            mlflow.log_metrics({f"{grain}_{m}": float(v) for m, v in leaderboard.loc[cand, grain].items() if pd.notna(v)})
             for _, r in backtest[(backtest["Model"] == cand) & (backtest["Grain"] == grain)].iterrows():
-                mlflow.log_metrics({f"fold_{grain}_sMAPE": r["sMAPE"], f"fold_{grain}_AccuracyPct": r["AccuracyPct"],
-                                    **({f"fold_{grain}_R2": r["R2"]} if pd.notna(r["R2"]) else {}), f"fold_{grain}_DirF1": r["DirF1"]}, step=int(r["Fold"]))
+                mlflow.log_metrics({f"fold_{grain}_sMAPE": r["sMAPE"], f"fold_{grain}_AccuracyPct": r["AccuracyPct"]}, step=int(r["Fold"]))
         mlflow.set_tag("champion", str(cand == CHAMPION))
 
 # METADATA ********************
@@ -649,7 +726,7 @@ with mlflow.start_run(run_name=f"champion_{CHAMPION}") as run: # purpose: to log
         fit_fn, predict_fn = COMPONENTS[comp]
         fitted[comp] = fit_fn(daily) #train on all data.
         preds[comp]  = predict_fn(fitted[comp], FORECAST_START, HORIZON_DAYS)
-    fc = blend(preds, CANDIDATES[CHAMPION]).rename(columns={"yhat": "ForecastRevenue", "yhat_lower": "ForecastLower", "yhat_upper": "ForecastUpper"})
+    fc = forward_blend(preds, CANDIDATES[CHAMPION]).rename(columns={"yhat": "ForecastRevenue", "yhat_lower": "ForecastLower", "yhat_upper": "ForecastUpper"})
 
     # daily table
     forecast_daily = fc.reset_index().rename(columns={"index": "ForecastDate", "ds": "ForecastDate"})

@@ -21,7 +21,7 @@ llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     google_api_key=api_key,
     temperature=0,
-    thinking_budget=0,  # this model otherwise spends a long time reasoning before a short SELECT
+    thinking_budget=0,
 )
 
 SCHEMA = """

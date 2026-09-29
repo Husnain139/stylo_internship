@@ -1,0 +1,14 @@
+{
+  "id": "clean",
+  "title": "Clean match",
+  "description": "PO, invoice, and payment agree at 180k with approval on file.",
+  "expected_rules": [],
+  "mode": "text",
+  "files": [
+    "purchase_order.pdf",
+    "invoice.pdf",
+    "payment.pdf",
+    "approval_policy.pdf"
+  ],
+  "images": []
+}

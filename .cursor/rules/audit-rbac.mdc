@@ -1,0 +1,15 @@
+---
+description: Role checks on every audit route and file read
+globs: audit_ai/**
+alwaysApply: false
+---
+
+# Audit RBAC
+
+Every new route must use the shared permission dependency and, for engagement data, a membership check.
+
+- `junior_auditor`: upload and read assigned engagements. No scope confirm or reject, analysis run, export, or finding approval.
+- `senior_auditor`: confirm, reject, or reopen scope, run analysis, export, approve / correct / reject findings.
+- `administrator`: users, membership, retention, read the audit log. No finding approval. No exemption from membership on file bytes.
+
+Do not add a route that returns a stored PDF, evidence row, or finding without both checks. Return 401 when the session is missing and 403 when the role or membership fails.

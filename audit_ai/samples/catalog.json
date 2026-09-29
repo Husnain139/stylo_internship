@@ -1,0 +1,104 @@
+[
+  {
+    "id": "mismatch",
+    "title": "Amount mismatch + missing approval",
+    "description": "PO 200k vs invoice/payment 250k; approval not found. Default demo pack.",
+    "expected_rules": [
+      "AMOUNT_MISMATCH",
+      "MISSING_APPROVAL"
+    ],
+    "file_count": 4,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "clean",
+    "title": "Clean match",
+    "description": "PO, invoice, and payment agree at 180k with approval on file.",
+    "expected_rules": [],
+    "file_count": 4,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "missing_po",
+    "title": "Invoice without matching PO",
+    "description": "Invoice references a PO that is not in the pack.",
+    "expected_rules": [
+      "UNMATCHED_INVOICE"
+    ],
+    "file_count": 4,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "duplicate_payment",
+    "title": "Duplicate payment candidate",
+    "description": "Two payments share vendor, amount, and date.",
+    "expected_rules": [
+      "DUPLICATE_PAYMENT"
+    ],
+    "file_count": 5,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "partial",
+    "title": "Incomplete evidence set",
+    "description": "Missing payment \u2014 scope should list missing evidence.",
+    "expected_rules": [],
+    "file_count": 3,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "multi_vendor",
+    "title": "Two vendor streams",
+    "description": "Two clean PO/invoice/payment chains plus one shared policy.",
+    "expected_rules": [],
+    "file_count": 7,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "kitchen_sink",
+    "title": "All finding types",
+    "description": "Mismatch, unmatched PO, duplicate payment, and a memo in one engagement.",
+    "expected_rules": [
+      "AMOUNT_MISMATCH",
+      "MISSING_APPROVAL",
+      "UNMATCHED_INVOICE",
+      "DUPLICATE_PAYMENT"
+    ],
+    "file_count": 7,
+    "image_count": 0,
+    "mode": "text"
+  },
+  {
+    "id": "scanned",
+    "title": "Scanned image-only pack (OCR path)",
+    "description": "Full pack rendered as image-only PDFs \u2014 no text layer. Expect unknown/empty extract until local OCR exists.",
+    "expected_rules": [],
+    "file_count": 4,
+    "image_count": 4,
+    "mode": "scanned"
+  },
+  {
+    "id": "hybrid",
+    "title": "Hybrid text + scanned invoice",
+    "description": "Text PO/payment/policy with an image-only invoice. Tests mixed evidence quality.",
+    "expected_rules": [],
+    "file_count": 4,
+    "image_count": 1,
+    "mode": "text"
+  },
+  {
+    "id": "noise",
+    "title": "Noise + unknown docs",
+    "description": "Internal memo plus open-source PDF fixtures. Scope incomplete.",
+    "expected_rules": [],
+    "file_count": 4,
+    "image_count": 1,
+    "mode": "text"
+  }
+]

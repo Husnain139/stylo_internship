@@ -1,0 +1,13 @@
+---
+description: Split AI extraction, Python verification, and human approval
+globs: audit_ai/**
+alwaysApply: false
+---
+
+# AI, code, and human
+
+- Classification and schema fill may be heuristic or a private model. Python parses amounts, dates, and totals.
+- Reconciliation, duplicate checks, policy limits, and risk bands are Python. Persist those numbers even if a model writes the sentence.
+- Keep raw evidence and processed findings on separate API responses and screens.
+- A finding is an exception requiring investigation. Do not label a person or vendor as fraudulent.
+- Only `senior_auditor` may set a finding to approved, corrected, or rejected. Scope must be confirmed before analysis.

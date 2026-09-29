@@ -1,0 +1,22 @@
+{
+  "id": "kitchen_sink",
+  "title": "All finding types",
+  "description": "Mismatch, unmatched PO, duplicate payment, and a memo in one engagement.",
+  "expected_rules": [
+    "AMOUNT_MISMATCH",
+    "MISSING_APPROVAL",
+    "UNMATCHED_INVOICE",
+    "DUPLICATE_PAYMENT"
+  ],
+  "mode": "text",
+  "files": [
+    "po_match.pdf",
+    "invoice_over.pdf",
+    "invoice_orphan.pdf",
+    "payment_a.pdf",
+    "payment_b.pdf",
+    "approval_policy.pdf",
+    "internal_memo.pdf"
+  ],
+  "images": []
+}

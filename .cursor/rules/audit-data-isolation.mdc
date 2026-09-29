@@ -1,0 +1,15 @@
+---
+description: Keep audit documents inside the company perimeter
+globs: audit_ai/**
+alwaysApply: false
+---
+
+# Audit data isolation
+
+- Default model mode is `heuristic` (no network). Allowed model hosts are only `localhost`, `127.0.0.1`, and `*.azure.com`.
+- Reject public LLM, OCR, embedding, and tracing hosts (OpenAI public API, Gemini, Groq, Hugging Face Inference, LangSmith).
+- Do not add LangChain. Do not set tracing environment variables.
+- Do not write source audit files to Fabric or any shared lakehouse.
+- Never put one engagement's document text into another engagement's prompt.
+- Explanation calls may send finding JSON only, after Python has computed the numbers.
+- Log metadata hashes, not document bodies, passwords, or tokens.

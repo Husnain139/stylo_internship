@@ -1,0 +1,13 @@
+---
+description: Append-only audit events for views, model calls, and edits
+globs: audit_ai/**
+alwaysApply: false
+---
+
+# Immutable audit trail
+
+- Record an `audit_events` row for every upload, classification, extraction, document view, evidence view, model call, scope change, analysis run, review decision, export, user change, and settings change.
+- Use UTC timestamps. Store a payload hash and the previous row's chain hash.
+- Do not add UPDATE or DELETE for `audit_events`. Do not add an HTTP DELETE route for documents, findings, or events.
+- Keep triggers that abort updates and deletes on `audit_events`.
+- Event payloads are metadata only. Do not store raw document text.

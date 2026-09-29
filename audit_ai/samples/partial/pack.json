@@ -1,0 +1,13 @@
+{
+  "id": "partial",
+  "title": "Incomplete evidence set",
+  "description": "Missing payment \u2014 scope should list missing evidence.",
+  "expected_rules": [],
+  "mode": "text",
+  "files": [
+    "purchase_order.pdf",
+    "invoice.pdf",
+    "approval_policy.pdf"
+  ],
+  "images": []
+}

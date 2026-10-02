@@ -1,0 +1,15 @@
+﻿invoice_id,vendor_name,vendor_email,invoice_date,amount,currency,po_number,line_description
+INV-1001,Acme Supplies,billing@acme.example,3/1/2026,1250.5,USD,PO-8801,Office paper bulk
+INV-1002,Northwind Traders,not-an-email,3/2/2026,480,USD,PO-8802,Toner cartridges
+INV-1003,,ap@globex.example,3/3/2026,2100,USD,PO-8803,Laptop docking stations
+,Contoso Ltd,finance@contoso.example,3/4/2026,95.25,USD,PO-8804,Shipping labels
+INV-1005,Fabrikam Inc,help@fabrikam.example,3/5/2026,N/A,USD,PO-8805,Ergonomic chairs
+INV-1006,Adventure Works,sales@adventure.example,3/6/2026,-40,USD,PO-8806,Credit adjustment
+INV-1002,Duplicate Vendor,dup@northwind.example,3/7/2026,480,USD,PO-8802,Duplicate invoice key
+INV-1008,Wide World,wwi@example,3/8/2026,abc,USD,,Missing amount and PO
+INV-1009,Tailspin Toys,tailspin@toys.example,3/9/2026,1500,USD,PO-8809,Valid row for baseline
+INV-1010,Litware Inc,litware@litware.example,3/10/2026,320.75,USD,PO-8810,Valid accessories kit
+INV-1010,Litware Inc,litware@litware.example,3/10/2026,320.75,USD,PO-8810,Valid accessories kit
+INV-1010,Litware Inc,litware@litware.example,3/10/2026,320.75,USD,PO-8810,Valid accessories kit
+,Contoso Ltd,finance@contoso.example,3/4/2026,95.25,USD,PO-8804,Shipping labels
+INV-1005,Fabrikam Inc,help@fabrikam.example,3/5/2026,N/A,USD,PO-8805,Ergonomic chairs

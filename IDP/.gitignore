@@ -1,0 +1,28 @@
+# Secrets & local env
+.env
+.env.local
+.env.*.local
+
+# Runtime data
+data/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/.pytest_cache/
+backend/.venv/
+backend/venv/
+*.egg-info/
+
+# Frontend
+web/node_modules/
+web/.next/
+web/out/
+web/.turbo/
+web/*.tsbuildinfo
+web/next-env.d.ts
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

@@ -37,33 +37,80 @@ dbo.revenue_weekly_gold(PeriodStart date, PeriodEnd date, ActualRevenue float, A
 Revenue on a sale line is Quantity * UnitPrice + Tax.
 Join factsales_gold to dimcustomer_gold on CustomerID, to dimproduct_gold on ItemID, and to dimdate_gold on OrderDate.
 """
-PROMPT = """Write one T-SQL SELECT that answers the question.
+PROMPT = """Answer with two parts and nothing else.
+First line, alone: chart: bar, line, pie, stacked, scatter, dot, bullet, box, correlation, or none.
+Then one T-SQL query. It may start with SELECT or WITH.
+
+Use chart: none when the question does not ask for a plot, chart, or graph.
 Use only the tables and columns in the context.
-Include TOP 50 unless the question asks for one number.
 Give every selected expression an alias.
-Return only the SQL, with no explanation.
+Do not use OFFSET or FETCH. TOP and OFFSET cannot be in the same query.
+Sales are SUM(Quantity * UnitPrice + Tax). Rank the most sold items by SUM(Quantity).
+A quarter is Q1 for Month 1-3, Q2 for 4-6, Q3 for 7-9, and Q4 for 10-12.
+When the question names dates, filter OrderDate, or Year and Month, or PeriodStart.
+
+Pie: a label, then one number. Use TOP 8.
+Simple bar: a label, then one number. Use TOP 50 unless the result is one number.
+Grouped bar or a line with several lines: category or date, series name, number. At most four series.
+Line or grouped bar over a year: group by month with mmmyyyy and Month, and order by Month.
+Stacked bar: category, series name, number. For quarterly sales the category is the item, the series is Q1 Q2 Q3 Q4, and the number is sales. Keep the top 8 items in an inner TOP 8, not on the outer SELECT, so each item has all four quarters. Order items by total sales descending, then quarter.
+Scatter: two numeric columns, x then y. An optional third column is a series name. Group by month or by item, not by order.
+Dot: a category and one number. An optional third column is a series name. Use TOP 12.
+Bullet: a label, the actual number, and the target number. ActualRevenue is on RecordType actual. ForecastRevenue is on RecordType forecast. Combine those rows by Year and Month so each label has both numbers. Use mmmyyyy as the label.
+Box: a category and one daily sales value. For quarters, the category is Q1 Q2 Q3 Q4 and each row is one day's sales. At most 400 rows.
+Correlation: one row per month and at least two numeric measure columns, such as quantity, sales, and tax. Do not return one row per order.
 
 Context:
 {context}
 
-Question:
+{history}Question:
 {question}
 """
-def sql_for(question):
-    text = llm.invoke(PROMPT.format(context=SCHEMA, question=question)).content
+def sql_for(question, history=None):
+    prior = ""
+    if history:
+        blocks = []
+        for turn in history[-4:]:
+            columns = ", ".join(turn.get("columns") or [])
+            blocks.append(
+                "Question: " + str(turn.get("question") or "") + "\n"
+                "Columns: " + columns + "\n"
+                "SQL:\n" + str(turn.get("sql") or "")
+            )
+        prior = (
+            "Previous turns in this chat, oldest first. "
+            "When the new question is a follow-up, change the latest SQL instead of starting over.\n"
+            + "\n\n".join(blocks)
+            + "\n\n"
+        )
+    text = llm.invoke(PROMPT.format(context=SCHEMA, history=prior, question=question)).content
     if not isinstance(text, str):
         text = "".join(getattr(part, "text", "") for part in text)
-    sql = text.strip()
-    if sql.startswith("```"):
-        lines = sql.splitlines()  # drops the opening ```sql fence
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()  # drops the opening ``` fence
         lines = lines[1:]
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
-        sql = "\n".join(lines).strip()
+        text = "\n".join(lines).strip()
+    chart = "none"
+    sql = text
+    charts = ("bar", "line", "pie", "stacked", "scatter", "dot", "bullet", "box", "correlation", "none")
+    aliases = {"stack": "stacked", "stackedbar": "stacked", "boxplot": "box", "corr": "correlation"}
+    if text.lower().startswith("chart:"):
+        after = text.split(":", 1)[1].strip()
+    else:
+        after = text
+    pieces = after.split(None, 1)
+    kind = aliases.get(pieces[0].lower().strip(".,"), pieces[0].lower().strip(".,")) if pieces else ""
+    if kind in charts:
+        chart = kind
+        sql = pieces[1].strip() if len(pieces) > 1 else ""
     sql = sql.strip().rstrip(";")  # pyodbc rejects a trailing semicolon
-    if not sql.lower().lstrip().startswith("select"):
-        raise SystemExit("The model did not return a SELECT:\n" + sql)
-    return sql
+    head = sql.lower().lstrip()
+    if not (head.startswith("select") or head.startswith("with")):
+        raise SystemExit("The model did not return a SELECT:\n" + text)
+    return chart, sql
 
 
 #-- sign in once and reuse the Gold connection --
@@ -153,10 +200,10 @@ def query_gold(sql):
         return columns, rows
 
 
-def run(question):
-    sql = sql_for(question)
+def run(question, history=None):
+    chart, sql = sql_for(question, history)
     columns, rows = query_gold(sql)
-    return {"columns": columns, "rows": rows, "sql": sql}
+    return {"chart": chart, "columns": columns, "rows": rows, "sql": sql}
 
 
 if __name__ == "__main__":

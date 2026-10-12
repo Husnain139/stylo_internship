@@ -69,8 +69,14 @@ app.add_middleware(
     allow_headers=["*"], #common headers --> Authorization: Bearer <token>, Content-Type: application/json, Accept: application/json.
 )
 
+class PriorTurn(BaseModel):
+    question: str = ""
+    sql: str = ""
+    columns: list[str] = []
+
 class AskBody(BaseModel): #Pydantic model that defines the expected request body for the /ask endpoint. basically, data validation.
     question: str
+    history: list[PriorTurn] = []
 
 @app.post("/ask") #When somebody sends a POST request to /ask, execute the ask() function.
 def ask(body: AskBody):
@@ -78,8 +84,11 @@ def ask(body: AskBody):
     if not question:
         raise HTTPException(status_code=400, detail="Enter a question.")
 
+    history = [turn.model_dump() for turn in body.history[-4:]]
     try:
-        return ask_nlp.run(question)
+        return ask_nlp.run(question, history)
     except SystemExit as exc:
         detail = exc.code if isinstance(exc.code, str) else "The query failed."
         raise HTTPException(status_code=500, detail=detail)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

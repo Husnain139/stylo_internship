@@ -1,0 +1,164 @@
+[
+  {
+    "type": "webhook",
+    "name": "lookup_order",
+    "description": "Look up an order from exactly 7 digits. Call this before saying status, shop, total, items, date, courier, or tracking number. Do not send a phone number or a tracking number. The result includes speak (say aloud), ui_json (pass to show_order_details), and optional table_markdown.",
+    "disable_interruptions": false,
+    "interruption_mode": "allow",
+    "force_pre_tool_speech": false,
+    "pre_tool_speech": "auto",
+    "tool_call_sound": null,
+    "tool_call_sound_behavior": "auto",
+    "tool_error_handling_mode": "auto",
+    "execution_mode": "immediate",
+    "follow_redirects": false,
+    "follow_redirects_allowed_domains": [],
+    "api_schema": {
+      "url": "https://stylo.app.n8n.cloud/webhook/stylo-order-desk",
+      "method": "POST",
+      "path_params_schema": [],
+      "query_params_schema": [],
+      "request_body_schema": {
+        "id": "body",
+        "type": "object",
+        "description": "Order lookup from 7 digits.",
+        "properties": [
+          {
+            "id": "action",
+            "type": "string",
+            "value_type": "constant",
+            "description": "",
+            "dynamic_variable": "",
+            "constant_value": "lookup_order",
+            "enum": null,
+            "is_system_provided": false,
+            "required": true
+          },
+          {
+            "id": "order_number",
+            "type": "string",
+            "value_type": "llm_prompt",
+            "description": "Exactly 7 digits of the order number, such as 3097074. Do not add SS-. Do not send a phone number or a tracking number.",
+            "dynamic_variable": "",
+            "constant_value": "",
+            "enum": null,
+            "is_system_provided": false,
+            "required": true
+          }
+        ],
+        "required": false,
+        "dynamic_variable": "",
+        "value_type": "llm_prompt"
+      },
+      "request_headers": [
+        {
+          "type": "value",
+          "name": "X-Desk-Secret",
+          "value": "PASTE_DESK_SECRET"
+        }
+      ],
+      "content_type": "application/json",
+      "auth_connection": null,
+      "mtls_auth_connection": null,
+      "response_filter": null
+    },
+    "assignments": [],
+    "response_timeout_secs": 30,
+    "dynamic_variables": {
+      "dynamic_variable_placeholders": {}
+    },
+    "response_mocks": []
+  },
+  {
+    "type": "webhook",
+    "name": "log_request",
+    "description": "Log a cancel, refund, exchange, or other change request after the caller clearly asks. Send the same 7 digits used for the lookup. This does not change the order.",
+    "disable_interruptions": false,
+    "interruption_mode": "allow",
+    "force_pre_tool_speech": false,
+    "pre_tool_speech": "auto",
+    "tool_call_sound": null,
+    "tool_call_sound_behavior": "auto",
+    "tool_error_handling_mode": "auto",
+    "execution_mode": "immediate",
+    "follow_redirects": false,
+    "follow_redirects_allowed_domains": [],
+    "api_schema": {
+      "url": "https://stylo.app.n8n.cloud/webhook/stylo-order-desk",
+      "method": "POST",
+      "path_params_schema": [],
+      "query_params_schema": [],
+      "request_body_schema": {
+        "id": "body",
+        "type": "object",
+        "description": "Change request to log",
+        "properties": [
+          {
+            "id": "action",
+            "type": "string",
+            "value_type": "constant",
+            "description": "",
+            "dynamic_variable": "",
+            "constant_value": "log_request",
+            "enum": null,
+            "is_system_provided": false,
+            "required": true
+          },
+          {
+            "id": "order_number",
+            "type": "string",
+            "value_type": "llm_prompt",
+            "description": "Exactly 7 digits of the order number, such as 3097074. Do not add SS-.",
+            "dynamic_variable": "",
+            "constant_value": "",
+            "enum": null,
+            "is_system_provided": false,
+            "required": true
+          },
+          {
+            "id": "request_type",
+            "type": "string",
+            "value_type": "llm_prompt",
+            "description": "One of cancel, refund, exchange, or other.",
+            "dynamic_variable": "",
+            "constant_value": "",
+            "enum": ["cancel", "refund", "exchange", "other"],
+            "is_system_provided": false,
+            "required": true
+          },
+          {
+            "id": "detail",
+            "type": "string",
+            "value_type": "llm_prompt",
+            "description": "The caller's request in a short sentence.",
+            "dynamic_variable": "",
+            "constant_value": "",
+            "enum": null,
+            "is_system_provided": false,
+            "required": true
+          }
+        ],
+        "required": false,
+        "dynamic_variable": "",
+        "value_type": "llm_prompt"
+      },
+      "request_headers": [
+        {
+          "type": "value",
+          "name": "X-Desk-Secret",
+          "value": "PASTE_DESK_SECRET"
+        }
+      ],
+      "content_type": "application/json",
+      "auth_connection": null,
+      "mtls_auth_connection": null,
+      "response_filter": null
+    },
+    "assignments": [],
+    "response_timeout_secs": 30,
+    "dynamic_variables": {
+      "dynamic_variable_placeholders": {}
+    },
+    "response_mocks": []
+  }
+]

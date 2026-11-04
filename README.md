@@ -1,6 +1,6 @@
 # Stylo Internship
 
-Portfolio repository for internship work at Stylo. It currently holds **four** independent projects; more will be added as the internship progresses.
+Portfolio repository for internship work at Stylo. It currently holds **five** independent projects; more will be added as the internship progresses.
 
 Each project lives in its own folder with its own notebooks, data (where applicable), and run notes. There is no single shared app stack for the whole repo.
 
@@ -12,6 +12,7 @@ Each project lives in its own folder with its own notebooks, data (where applica
 | **Solar predictor** | [`solar_predictor/`](solar_predictor/) | Predicts solar plant inverter **AC power** from Plant 1 generation and weather sensor CSVs (EDA, cleaning, features, scaled linear regression). |
 | **Solar RAG** | [`solar_rag/`](solar_rag/) | RAG over PDFs (LangChain + Gemini). The chunk table is stored in the SolarRAG Fabric lakehouse. |
 | **Sales RAG** | [`sales_rag/`](sales_rag/) | Question over the Gold warehouse: one prompt turns the question into SQL, then answers from the result rows. |
+| **Voice desk** | [`voice_desk/`](voice_desk/) | Inbound phone agent: the caller says 7 order digits. ElevenLabs answers from the order API, and change requests go to a Google Sheet. |
 
 ### `sales_predictor`
 
@@ -90,6 +91,7 @@ sales_predictor/                 # Fabric sales revenue forecasting
 solar_predictor/                 # Solar AC power prediction (CSV + notebook)
 solar_rag/                       # PDF RAG + Fabric OneLake storage
 sales_rag/                       # Gold warehouse question → SQL → answer
+voice_desk/                      # Inbound order desk: ElevenLabs + n8n + order lookup
 Revenue_Forecast_Notebook.Notebook/   # Fabric-synced source for the sales notebook
 ```
 

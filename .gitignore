@@ -19,6 +19,9 @@ htmlcov/
 .ipynb_checkpoints/
 mlruns/
 
+# Real Ginkgo order body. Paste locally. Do not commit.
+voice_desk/data/ginkgo_sample_response.json
+
 # Secrets and machine-specific configuration
 .env
 .env.*

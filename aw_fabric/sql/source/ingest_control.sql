@@ -12,31 +12,49 @@
     Excluded: the cdc schema, dbo.AWBuildVersion, dbo.sysdiagrams,
     dbo.systranschemas, and Person.Password.
 
-    is_core = 1 marks Silver inputs. BusinessEntityAddress, AddressType,
-    PhoneNumberType, SalesReason, and SpecialOfferProduct are core because
-    Gold cannot resolve geography, phone, sales reason, or the detail-to-offer
-    foreign key without them. They are not Gold tables.
+    is_core = 1 marks Silver inputs for FactSales and FactStock.
+    BusinessEntityAddress, AddressType, and PhoneNumberType are core because
+    the person and store dimensions need one address and one phone. They are
+    not Gold tables. TransactionHistory and TransactionHistoryArchive feed
+    FactStock. UnitMeasure supplies the product size and weight unit names.
+    ProductInventory is not core. FactStock does not read it.
+
+    fabric_user is only db_datareader. SQL Server hides alias types from
+    that login, so sys.types has no row for Name, Flag, NameStyle, Phone,
+    AccountNumber, or OrderNumber. The column is still visible in
+    sys.columns, with system_type_id pointing at nvarchar or bit. Joining
+    the alias type drops the column. This script joins the system type id
+    on the column instead.
+
+    Those aliases cast as:
+      Name           nvarchar(50)   a column literally named Name is also
+                                    renamed to {Table}Name
+      Flag           bit
+      NameStyle      bit
+      Phone          nvarchar(25)
+      AccountNumber  nvarchar(15)
+      OrderNumber    nvarchar(25)
+    Columns that already use a system type (int, nvarchar, money, datetime,
+    uniqueidentifier, decimal) are copied as they are.
+    Separate casts, not aliases: time to nvarchar(16), xml to nvarchar(max),
+    sysname to nvarchar(128), geography to text plus Srid, hierarchyid to
+    text. varbinary, binary, and image columns are left out.
 */
 WITH core_table AS (
     SELECT schema_name, table_name
     FROM (VALUES
         (N'Sales',          N'SalesOrderHeader'),
         (N'Sales',          N'SalesOrderDetail'),
-        (N'Sales',          N'SalesOrderHeaderSalesReason'),
-        (N'Sales',          N'SalesReason'),
         (N'Sales',          N'Customer'),
         (N'Sales',          N'Store'),
-        (N'Sales',          N'SpecialOffer'),
-        (N'Sales',          N'SpecialOfferProduct'),
-        (N'Sales',          N'Currency'),
-        (N'Sales',          N'CurrencyRate'),
         (N'Sales',          N'SalesTerritory'),
-        (N'Sales',          N'SalesPerson'),
-        (N'Sales',          N'SalesPersonQuotaHistory'),
         (N'Production',     N'Product'),
         (N'Production',     N'ProductSubcategory'),
         (N'Production',     N'ProductCategory'),
         (N'Production',     N'ProductCostHistory'),
+        (N'Production',     N'UnitMeasure'),
+        (N'Production',     N'TransactionHistory'),
+        (N'Production',     N'TransactionHistoryArchive'),
         (N'Person',         N'Person'),
         (N'Person',         N'EmailAddress'),
         (N'Person',         N'PersonPhone'),
@@ -45,9 +63,7 @@ WITH core_table AS (
         (N'Person',         N'StateProvince'),
         (N'Person',         N'CountryRegion'),
         (N'Person',         N'BusinessEntityAddress'),
-        (N'Person',         N'AddressType'),
-        (N'Purchasing',     N'ShipMethod'),
-        (N'HumanResources', N'Employee')
+        (N'Person',         N'AddressType')
     ) AS v(schema_name, table_name)
 ),
 base_type AS (
@@ -59,17 +75,28 @@ base_type AS (
         c.precision,
         c.scale,
         c.is_computed,
-        ty.name AS declared_type,
-        bt.name AS physical_type
+        CAST(CASE
+                WHEN ty.is_user_defined = 1 THEN 1
+                WHEN ty.user_type_id IS NULL
+                     AND sysbt.user_type_id IS NOT NULL
+                     AND c.user_type_id <> c.system_type_id THEN 1
+                ELSE 0
+            END AS bit) AS is_user_defined,
+        COALESCE(ty.name, sysbt.name) AS declared_type,
+        bt.name AS physical_type,
+        CASE
+            WHEN c.name = N'Name' THEN OBJECT_NAME(c.object_id) + N'Name'
+            ELSE c.name
+        END AS output_name
     FROM sys.columns AS c
-    INNER JOIN sys.types AS ty
+    LEFT JOIN sys.types AS ty
         ON ty.user_type_id = c.user_type_id
+    LEFT JOIN sys.types AS sysbt
+        ON sysbt.user_type_id = c.system_type_id
+       AND sysbt.is_user_defined = 0
     INNER JOIN sys.types AS bt
-        ON bt.user_type_id = CASE
-               WHEN ty.is_user_defined = 1 THEN ty.system_type_id
-               ELSE ty.user_type_id
-           END
-       AND bt.is_user_defined = 0
+        ON bt.is_user_defined = 0
+       AND bt.user_type_id = COALESCE(sysbt.user_type_id, c.user_type_id)
     WHERE c.is_hidden = 0
 ),
 projected AS (
@@ -107,21 +134,24 @@ projected AS (
         SELECT
             CAST(1 AS int) AS part_no,
             CASE
-                WHEN b.physical_type IN (N'varbinary', N'binary', N'image')
+                WHEN b.is_user_defined = 0
+                     AND b.physical_type IN (N'varbinary', N'binary', N'image')
                      AND b.declared_type NOT IN (N'timestamp', N'rowversion')
                     THEN CAST(NULL AS nvarchar(max))
                 WHEN b.declared_type = N'geography'
-                    THEN QUOTENAME(b.column_name) + N'.STAsText() AS ' + QUOTENAME(b.column_name)
+                    THEN QUOTENAME(b.column_name) + N'.STAsText() AS ' + QUOTENAME(b.output_name)
                 WHEN b.declared_type = N'hierarchyid'
-                    THEN QUOTENAME(b.column_name) + N'.ToString() AS ' + QUOTENAME(b.column_name)
+                    THEN QUOTENAME(b.column_name) + N'.ToString() AS ' + QUOTENAME(b.output_name)
                 WHEN b.declared_type = N'xml'
-                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS nvarchar(max)) AS ' + QUOTENAME(b.column_name)
+                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS nvarchar(max)) AS ' + QUOTENAME(b.output_name)
                 WHEN b.declared_type IN (N'timestamp', N'rowversion')
-                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS varbinary(8)) AS ' + QUOTENAME(b.column_name)
+                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS varbinary(8)) AS ' + QUOTENAME(b.output_name)
                 WHEN b.declared_type = N'sysname'
-                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS nvarchar(128)) AS ' + QUOTENAME(b.column_name)
-                WHEN b.declared_type <> b.physical_type AND b.is_computed = 0
-                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS ' + cast_to.cast_type + N') AS ' + QUOTENAME(b.column_name)
+                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS nvarchar(128)) AS ' + QUOTENAME(b.output_name)
+                WHEN b.physical_type = N'time'
+                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS nvarchar(16)) AS ' + QUOTENAME(b.output_name)
+                WHEN b.is_user_defined = 1 OR b.column_name <> b.output_name
+                    THEN N'CAST(' + QUOTENAME(b.column_name) + N' AS ' + cast_to.cast_type + N') AS ' + QUOTENAME(b.output_name)
                 ELSE QUOTENAME(b.column_name)
             END AS expr
         UNION ALL
@@ -156,6 +186,7 @@ primary_key AS (
     GROUP BY ic.object_id
 )
 SELECT
+    N'v4' AS query_build,
     s.name AS source_schema,
     t.name AS source_table,
     s.name AS dest_schema,

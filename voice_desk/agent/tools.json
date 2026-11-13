@@ -14,7 +14,7 @@
     "follow_redirects": false,
     "follow_redirects_allowed_domains": [],
     "api_schema": {
-      "url": "https://stylo.app.n8n.cloud/webhook/stylo-order-desk",
+      "url": "https://YOUR_TUNNEL_URL/webhook/stylo-order-desk",
       "method": "POST",
       "path_params_schema": [],
       "query_params_schema": [],
@@ -84,7 +84,7 @@
     "follow_redirects": false,
     "follow_redirects_allowed_domains": [],
     "api_schema": {
-      "url": "https://stylo.app.n8n.cloud/webhook/stylo-order-desk",
+      "url": "https://YOUR_TUNNEL_URL/webhook/stylo-order-desk",
       "method": "POST",
       "path_params_schema": [],
       "query_params_schema": [],

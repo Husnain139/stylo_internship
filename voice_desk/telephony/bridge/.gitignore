@@ -1,0 +1,4 @@
+.env
+config/pjsip.conf
+config/extensions.conf
+config/rtp.conf

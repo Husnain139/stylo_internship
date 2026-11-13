@@ -4,27 +4,27 @@ Read this file first, then the extracts in `docs/source/`.
 
 ## 1. Project summary
 
-Medallion project on a Fabric trial capacity. The source is AdventureWorks2025 on SQL Server 2025, through the on-premises data gateway. `AdventureWorksDW2025` is the Gold shape only. Do not load it into Fabric. Do not restore the OLTP database. Database CDC stays enabled and no table is captured.
+Medallion project on a Fabric trial capacity. The source is AdventureWorks2025 on SQL Server 2025, through the on-premises data gateway. Do not load `AdventureWorksDW2025`. Do not restore the OLTP database. Database CDC stays enabled and no table is captured.
 
 ```
 SQL Server 2025 -> gateway -> lh_AdventureWorks_Bronze (69 raw Delta tables)
                            -> lh_AdventureWorks_Silver (cleansed schema, Gold inputs only)
-                           -> wh_AdventureWorks_Gold   (sales star, T-SQL)
+                           -> wh_AdventureWorks_Gold   (FactSales, FactStock, dimensions)
                            -> Power BI semantic model (Direct Lake on OneLake)
 ```
 
-Spark cleans. The warehouse loads Gold in one transaction. Purchasing, work orders, and inventory stay in Bronze.
+Spark cleans. The warehouse loads Gold in one transaction.
 
 ## 2. Source of truth
 
 - `docs/source/adventure_works.txt`: OLTP tables, keys, foreign keys, row counts
-- `docs/source/adventure_works_dw.txt`: warehouse shape, keys, foreign keys, row counts
+- `docs/source/adventure_works_dw.txt`: warehouse extract kept for reference only
 - `docs/decisions.md`: decision log
 - `docs/part1-architecture.md`: architecture
 
-Never invent a table or column. Gold row counts will not match the warehouse backup. This OLTP has 121,317 order lines. The backup's internet and reseller facts add up to 121,253.
+Never invent a table or column. This OLTP has 121,317 order lines.
 
-Banned names: `Person.Contact`, `Sales.Individual`, `CustomerAddress`, `EmployeeAddress`, `StoreContact`, `VendorContact`, `ContactCreditCard`, `Employee.ManagerID`, `Sales.Customer.CustomerType`. `Person.ContactType` is a real table and is not a Gold input.
+Banned names: `Person.Contact`, `Sales.Individual`, `CustomerAddress`, `EmployeeAddress`, `StoreContact`, `VendorContact`, `ContactCreditCard`, `Employee.ManagerID`, `Sales.Customer.CustomerType`.
 
 ## 3. Naming
 
@@ -34,13 +34,14 @@ Banned names: `Person.Contact`, `Sales.Individual`, `CustomerAddress`, `Employee
 | Warehouse | `wh_AdventureWorks_Gold` |
 | Silver entities | `cleansed.<Entity>` |
 | Silver logs | `etl.quarantine`, `etl.dq_result`, `etl.load_log` |
-| Gold | `DimXxx`, `FactXxx` |
+| Gold facts | `FactSales`, `FactStock` |
+| Gold dimensions | `DimDate`, `DimCustomer`, `DimStore`, `DimProduct` |
 | Surrogate | `<Entity>Key`. Business keys keep the source name |
 | Audit | `dbo.ETL_Log` |
 | Watermark | `dbo.ingest_watermark` |
 | Load | `dbo.usp_Load_Gold` |
 
-No `Silver_` prefix.
+No `Silver_` prefix. No `DimLocation`.
 
 ## 4. Bronze
 
@@ -48,9 +49,11 @@ Raw landing. Source schema and table names. The control query is `sql/source/ing
 
 Excluded: the `cdc` schema, `dbo.AWBuildVersion`, `dbo.sysdiagrams`, `dbo.systranschemas`, `Person.Password`, and views.
 
-Type serialization in that query, and nowhere else: geography to WKT plus SRID, `hierarchyid` to string, `xml` to `nvarchar(max)`, alias types cast from `sys.types`, `varbinary` / `binary` / `image` omitted. Computed columns are selected as stored values.
+Type serialization in that query: geography to WKT plus SRID, `hierarchyid` to string, `xml` to `nvarchar(max)`, alias types cast from `sys.types`, `varbinary` / `binary` / `image` omitted.
 
-`is_core = 1` is the Silver input list. Everything else is copied and then ignored. Default load is full overwrite. Incremental upsert is only `Sales.SalesOrderHeader` and `Sales.SalesOrderDetail`.
+`is_core = 1` includes `Production.TransactionHistory` and `Production.TransactionHistoryArchive`. `ProductInventory` is copied and is not core.
+
+Default load is full overwrite. Incremental upsert is only `Sales.SalesOrderHeader` and `Sales.SalesOrderDetail`.
 
 Never put credentials in code or docs.
 
@@ -58,35 +61,34 @@ Never put credentials in code or docs.
 
 One Fabric Runtime 2.0 notebook. Read Bronze, write `cleansed` tables for Gold inputs only.
 
-`SalesOrderLineNumber` is `ROW_NUMBER()` within `SalesOrderID` ordered by `SalesOrderDetailID`. It is not `SalesOrderDetailID`. Keep `SalesOrderDetailID` for reconciliation.
+`FactSales` line id is `SalesOrderDetailID`. Do not replace it with a `tinyint` sequence.
 
-Drop `rowguid` and `ModifiedDate`, except `ModifiedDate` on the two watermark tables. Drop `CardNumber`, `NationalIDNumber`, `LoginID`, and `BirthDate`.
+Drop `rowguid` and `ModifiedDate`, except `ModifiedDate` on the two watermark tables and the product `ModifiedDate` kept on `DimProduct`. Drop `CardNumber`, `NationalIDNumber`, `LoginID`, and `BirthDate` if those columns are read.
 
-Money is `DecimalType(19,4)`. Nulls use a documented default. Do not drop rows silently. Deduplicate on the business key. Rejects go to `etl.quarantine`.
+Money is `DecimalType(19,4)`. Nulls use a documented default. Do not drop rows silently. Rejects go to `etl.quarantine`.
 
-`DimCustomer` is `Sales.Customer` where `StoreID` is null. `DimReseller` is `Sales.Store`. Geography is distinct city, state, and country, reached through `Person.BusinessEntityAddress`. One address per owner. Address-type priority is fixed from the six `AddressType` names after they are read, not guessed.
+Person address priority is Primary, then Home, then Billing, then Shipping. Tie-break `AddressID`. Store address is `AddressTypeID` 3 (Main Office) only.
 
-V-Order on. No partitioning, Z-order, or liquid clustering. A failed table is logged and must not disappear silently.
+V-Order on. No partitioning, Z-order, or liquid clustering.
 
 ## 6. Gold
 
-`dbo.usp_Load_Gold` is one transaction. Keys are declared `NOT ENFORCED`. The load rejects duplicates. Unknown member is `-1`.
+`dbo.usp_Load_Gold` is one transaction. Keys are declared `NOT ENFORCED`. Unknown member is `-1`.
 
-`FactInternetSales` is `OnlineOrderFlag = 1`. `FactResellerSales` is `OnlineOrderFlag = 0`. Both use primary key `(SalesOrderNumber, SalesOrderLineNumber)`.
+`FactSales` is one row per order line. `NetPrice = UnitPrice * Qty * (1 - UnitPriceDiscount)`. `UnitPriceDiscount` is a rate. Total sales is `NetPrice`. `Tax` and `Freight` are allocated by the line's share of header `SubTotal`. A zero subtotal keeps both amounts on the first line. `StandardCost` is `ProductCostHistory` as of `OrderDate`, else `Product.StandardCost`.
 
-`FactInternetSalesReason` primary key is `(SalesOrderNumber, SalesOrderLineNumber, SalesReasonKey)`. The OLTP table is header grain, 27,647 rows, key `(SalesOrderID, SalesReasonID)`. Stamp each reason onto every line of that internet order. `DimSalesReason.SalesReasonAlternateKey` is `SalesReasonID`.
+`DimCustomer` is a person. `DimStore` is a store. Store-only lines use customer `-1`. Person-only lines use store `-1`.
 
-`PromotionKey` is on both line facts, from `SalesOrderDetail.SpecialOfferID`.
+`FactStock` is one row per product per day from both transaction tables. Ignore `TransactionType = W`.
 
-`UnitPriceDiscount` is a rate. `DiscountAmount = UnitPrice * OrderQty * UnitPriceDiscount`. `SalesAmount` is recomputed as `decimal(19,4)`. `TotalProductCost = unit cost * OrderQty`. Unit cost is `ProductCostHistory` as of `OrderDate`, else `Product.StandardCost`.
+- `PurchaseQty` = `P` on that day
+- `SalesQty` = `S` on that day
+- `OpeningQty` = purchases minus sales before that day. The first day opens at 0.
+- `ClosingQty` = `OpeningQty + PurchaseQty - SalesQty`
 
-`TaxAmt` and `Freight` are allocated by the line's share of header `SubTotal`. Line sums must equal the header. A zero subtotal keeps both amounts on the first line.
+Do not sum opening or closing across days. Opening for a period is `OpeningQty` on the first selected date. Closing is opening plus the period's purchases minus the period's sales.
 
-A null `CurrencyRateID` maps to USD only after a query shows those orders are USD. Until then, quarantine the rows.
-
-Log `OnlineOrderFlag` versus `StoreID` mismatches. Do not fail the load on that check until the rate is measured.
-
-Do not build `FactFinance`, `FactCallCenter`, `FactSurveyResponse`, or a daily inventory fact.
+`FactStock` is not the shelf quantity. Do not read `ProductInventory` into it. Do not call opening or closing the quantity on the shelf. There is no `DimLocation`.
 
 ## 7. Trial
 

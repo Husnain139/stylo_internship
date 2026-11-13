@@ -1,6 +1,6 @@
 # Stylo Internship
 
-Portfolio repository for internship work at Stylo. It currently holds **five** independent projects; more will be added as the internship progresses.
+Portfolio repository for internship work at Stylo. It currently holds **six** independent projects; more will be added as the internship progresses.
 
 Each project lives in its own folder with its own notebooks, data (where applicable), and run notes. There is no single shared app stack for the whole repo.
 
@@ -13,6 +13,7 @@ Each project lives in its own folder with its own notebooks, data (where applica
 | **Solar RAG** | [`solar_rag/`](solar_rag/) | RAG over PDFs (LangChain + Gemini). The chunk table is stored in the SolarRAG Fabric lakehouse. |
 | **Sales RAG** | [`sales_rag/`](sales_rag/) | Question over the Gold warehouse: one prompt turns the question into SQL, then answers from the result rows. |
 | **Voice desk** | [`voice_desk/`](voice_desk/) | Inbound phone agent: the caller says 7 order digits. ElevenLabs answers from the order API, and change requests go to a Google Sheet. |
+| **HR desk** | [`hr_desk/`](hr_desk/) | Employees ask about Stylo policies. Answers stay inside the written policy, and each role only sees its own policies. |
 
 ### `sales_predictor`
 
@@ -82,6 +83,18 @@ az login
 python ask_nlp.py "What was total revenue in 2020?"
 ```
 
+### `hr_desk`
+
+Employees ask about written policies. The Python API checks the question, searches only the policies that role can see, and answers with a short model. The Next.js screen is the part employees and HR use. See [`hr_desk/README.md`](hr_desk/README.md).
+
+```powershell
+cd hr_desk
+docker compose up -d
+cd backend
+python -m evals
+uvicorn app.main:app --port 8000
+```
+
 ## Repository layout
 
 ```
@@ -92,6 +105,7 @@ solar_predictor/                 # Solar AC power prediction (CSV + notebook)
 solar_rag/                       # PDF RAG + Fabric OneLake storage
 sales_rag/                       # Gold warehouse question → SQL → answer
 voice_desk/                      # Inbound order desk: ElevenLabs + n8n + order lookup
+hr_desk/                         # HR policy assistant: Python RAG API + Next.js screen
 Revenue_Forecast_Notebook.Notebook/   # Fabric-synced source for the sales notebook
 ```
 

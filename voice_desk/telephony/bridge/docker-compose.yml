@@ -1,0 +1,17 @@
+# On-prem Asterisk SIP bridge: Issabel/Elastix (LAN) ↔ ElevenLabs (TLS out).
+# Fill .env from .env.example before starting.
+
+services:
+  asterisk:
+    image: andrius/asterisk:latest
+    container_name: stylo-sip-bridge
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./config/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./config/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./config/rtp.conf:/etc/asterisk/rtp.conf:ro
+      - ./config/modules.conf:/etc/asterisk/modules.conf:ro
+    # host network: SIP/RTP bind on BRIDGE_IP without extra port maps

@@ -1,0 +1,646 @@
+{
+  "name": "Stylo order desk",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stylo-order-desk",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "fe0df90b-d214-4ded-9f61-01393f93dfc1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        8096,
+        1776
+      ],
+      "webhookId": "stylo-order-desk"
+    },
+    {
+      "parameters": {
+        "jsCode": "function text(value) {\n  if (value === undefined || value === null) return '';\n  return String(value).trim();\n}\n\nfunction readConfig(name) {\n  try {\n    if (typeof $vars !== 'undefined' && $vars[name]) return text($vars[name]);\n  } catch (error) {}\n  try {\n    if (typeof $env !== 'undefined' && $env[name]) return text($env[name]);\n  } catch (error) {}\n  return '';\n}\n\nfunction payloadOf(found, speak, extra) {\n  return {\n    found: found,\n    speak: speak,\n    order_name: extra.order_name || '',\n    action: extra.action || ''\n  };\n}\n\nfunction respond(httpStatus, found, speak, extra) {\n  const payload = payloadOf(found, speak, extra || {});\n  return {\n    httpStatus: httpStatus,\n    bodyText: JSON.stringify(payload),\n    found: found,\n    speak: speak,\n    order_name: payload.order_name,\n    action: payload.action\n  };\n}\n\nfunction toOrderNumber(value) {\n  const raw = text(value).toUpperCase().replace(/\\s+/g, '');\n  let digits = '';\n  const exact = raw.match(/^SS-(\\d+)(?:_1)?$/);\n  if (exact) digits = exact[1];\n  else {\n    const underscored = raw.match(/^(\\d+)_1$/);\n    if (underscored) digits = underscored[1];\n    else digits = raw.replace(/\\D/g, '');\n  }\n  if (!/^\\d{7}$/.test(digits)) return '';\n  return 'SS-' + digits;\n}\n\nconst root = $input.first().json;\nconst headers = root.headers || {};\nconst providedSecret = text(headers['x-desk-secret'] || headers['X-Desk-Secret']);\nconst expected = readConfig('DESK_SECRET');\nconst source = root.body && typeof root.body === 'object' && !Array.isArray(root.body) ? root.body : root;\nconst action = text(source.action);\nconst requestType = text(source.request_type).toLowerCase();\nconst detail = text(source.detail);\nconst base = readConfig('GINKGO_BASE_URL');\nconst auth = readConfig('GINKGO_AUTH');\nconst sheetId = readConfig('SHEET_ID');\nconst orderNumber = toOrderNumber(source.order_number);\n\nif (!expected) {\n  return [{ json: respond(500, false, 'The order desk is not configured yet.', { action: action }) }];\n}\nif (providedSecret !== expected) {\n  return [{ json: respond(401, false, 'The order desk refused this request.', { action: action }) }];\n}\nif (action !== 'lookup_order' && action !== 'log_request') {\n  return [{ json: respond(400, false, 'The order desk could not understand that request.', { action: action }) }];\n}\nif (!orderNumber) {\n  return [{ json: respond(400, false, 'I need exactly 7 digits of the order number.', { action: action }) }];\n}\nif (action === 'log_request' && ['cancel', 'refund', 'exchange', 'other'].indexOf(requestType) === -1) {\n  return [{ json: respond(400, false, 'I need a cancel, refund, exchange, or other request.', { action: action }) }];\n}\nif (!base || !auth) {\n  return [{ json: respond(500, false, 'The order desk is not configured yet.', { action: action }) }];\n}\n\nconst endpoint = base.split('#')[0].split('?')[0];\nreturn [{\n  json: {\n    httpStatus: 200,\n    action: action,\n    request_type: requestType,\n    detail: detail,\n    query_key: 'order_number',\n    query_value: orderNumber,\n    ginkgo_url: endpoint + '?order_number=' + encodeURIComponent(orderNumber),\n    sheet_ready: Boolean(sheetId)\n  }\n}];"
+      },
+      "id": "614d42ea-3f58-4b4e-afa2-30ee3f6e8e8a",
+      "name": "Normalize request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8352,
+        1776
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a11ce003-0001-4000-8000-000000000003-cond",
+              "leftValue": "={{ $json.httpStatus }}",
+              "rightValue": 200,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6e5f294b-72fb-465c-9b5e-65358353b90d",
+      "name": "Request allowed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        8640,
+        1776
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "route-lookup",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "lookup_order",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "lookup_order"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "route-log",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "log_request",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "log_request"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "9f84097f-e5a0-4386-9d9b-05a25a130b5f",
+      "name": "Route action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        8832,
+        1264
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.ginkgo_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $env.GINKGO_AUTH }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "c3a6e4e5-0139-4cfe-bdbd-db5c980f4b52",
+      "name": "Ginkgo lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        9136,
+        1136
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function text(value) {\n  if (value === undefined || value === null) return '';\n  return String(value).trim();\n}\n\nvar DIGIT_WORDS = {\n  '0': 'zero',\n  '1': 'one',\n  '2': 'two',\n  '3': 'three',\n  '4': 'four',\n  '5': 'five',\n  '6': 'six',\n  '7': 'seven',\n  '8': 'eight',\n  '9': 'nine'\n};\n\nfunction speakDigits(value) {\n  var digits = text(value).replace(/\\D/g, '');\n  if (!digits) return '';\n  return digits.split('').map(function (d) {\n    return DIGIT_WORDS[d] || d;\n  }).join(' ');\n}\n\nfunction stripOrderSuffix(value) {\n  return text(value).replace(/_1$/i, '');\n}\n\nfunction speakOrderId(value) {\n  var cleaned = stripOrderSuffix(value).toUpperCase().replace(/\\s+/g, '');\n  var match = cleaned.match(/^SS-?(\\d+)$/i);\n  var digits = match ? match[1] : cleaned.replace(/\\D/g, '');\n  if (!digits) return text(value);\n  return 'S S dash ' + speakDigits(digits);\n}\n\nfunction displayOrderId(value) {\n  var cleaned = stripOrderSuffix(value).toUpperCase().replace(/\\s+/g, '');\n  var match = cleaned.match(/^SS-?(\\d+)$/i);\n  if (match) return 'SS-' + match[1];\n  var digits = cleaned.replace(/\\D/g, '');\n  return digits ? 'SS-' + digits : stripOrderSuffix(value);\n}\n\nfunction payloadOf(found, speak, extra) {\n  return {\n    found: found,\n    speak: speak,\n    order_name: extra.order_name || '',\n    action: extra.action || ''\n  };\n}\n\nfunction respond(httpStatus, found, speak, extra) {\n  var payload = payloadOf(found, speak, extra || {});\n  return {\n    httpStatus: httpStatus,\n    bodyText: JSON.stringify(payload),\n    found: found,\n    speak: speak,\n    order_name: payload.order_name,\n    action: payload.action\n  };\n}\n\nfunction money(amount) {\n  var number = Number(amount);\n  if (!Number.isFinite(number)) return text(amount);\n  var shown = Math.round(number) === number ? String(Math.round(number)) : number.toFixed(2);\n  return shown + ' rupees';\n}\n\nfunction parseLineItems(details) {\n  var raw = text(details).replace(/\\s+/g, ' ');\n  if (!raw) return [];\n  var chunks = raw.split(/\\s*;\\s*|\\s*\\|\\s*|\\n+/).map(function (part) {\n    return part.trim();\n  }).filter(Boolean);\n  if (chunks.length === 0) chunks = [raw];\n  return chunks.map(function (chunk) {\n    var qty = '';\n    var qtyMatch = chunk.match(/\\bQty\\s*=\\s*([0-9]+(?:\\.[0-9]+)?)/i);\n    if (qtyMatch) qty = qtyMatch[1];\n    var withoutQty = chunk.replace(/\\s*Qty\\s*=\\s*[0-9.]+/gi, '').trim();\n    var sku = '';\n    var skuMatch = withoutQty.match(/(?:^|\\s)-\\s*([A-Z]{1,6}\\d+)\\s*$/i) || withoutQty.match(/\\b([A-Z]{1,6}\\d+)\\s*$/i);\n    if (skuMatch) {\n      sku = skuMatch[1].toUpperCase();\n      withoutQty = withoutQty.replace(/(?:^|\\s)-\\s*[A-Z]{1,6}\\d+\\s*$/i, '').replace(/\\b[A-Z]{1,6}\\d+\\s*$/i, '').trim();\n    }\n    return {\n      name: withoutQty || 'Item',\n      sku: sku,\n      qty: qty\n    };\n  });\n}\n\nfunction itemsPhrase(details) {\n  var items = parseLineItems(details);\n  if (items.length === 0) return '';\n  return items.map(function (item) {\n    var line = item.name;\n    if (item.sku) line += ' ' + item.sku;\n    if (item.qty) line += ', quantity ' + item.qty;\n    return line;\n  }).join('. ');\n}\n\nfunction itemLabel(details) {\n  var items = parseLineItems(details);\n  if (items.length === 0) return '';\n  return items[0].name;\n}\n\nfunction buildUi(order) {\n  return {\n    order_number: displayOrderId(order.order_number),\n    shop_name: text(order.shop_name),\n    status: text(order.status),\n    total_price: text(order.total_price),\n    created_at: text(order.created_at),\n    courier_name: text(order.courier_name),\n    tracking_number: text(order.tracking_number),\n    products: parseLineItems(order.order_details)\n  };\n}\n\nfunction tableMarkdownFromOrders(orderUis) {\n  var lines = [\n    '| Order | Item | SKU | Qty | Status |',\n    '| --- | --- | --- | --- | --- |'\n  ];\n  var any = false;\n  (orderUis || []).forEach(function (orderUi) {\n    var products = orderUi.products || [];\n    if (products.length === 0) {\n      any = true;\n      lines.push(\n        '| ' + (orderUi.order_number || '—') +\n        ' | — | — | — | ' + (orderUi.status || '—') + ' |'\n      );\n      return;\n    }\n    products.forEach(function (item) {\n      any = true;\n      lines.push(\n        '| ' + (orderUi.order_number || '—') +\n        ' | ' + (item.name || '—') +\n        ' | ' + (item.sku || '—') +\n        ' | ' + (item.qty || '—') +\n        ' | ' + (orderUi.status || '—') + ' |'\n      );\n    });\n  });\n  if (!any) lines.push('| — | — | — | — | — |');\n  return lines.join('\\n');\n}\n\nfunction wrapOrdersUi(orderUis, extra) {\n  var ui = Object.assign({\n    orders: orderUis\n  }, extra || {});\n  return {\n    ui: ui,\n    table_markdown: tableMarkdownFromOrders(orderUis),\n    ui_json: JSON.stringify(ui)\n  };\n}\n\nfunction speakOrder(order) {\n  var status = text(order.status) || 'unknown';\n  var orderId = displayOrderId(order.order_number);\n  var line = 'Order ' + speakOrderId(order.order_number);\n  if (text(order.shop_name)) line += ' from ' + text(order.shop_name);\n  line += ' is ' + status + '.';\n  if (text(order.total_price)) line += ' The total is ' + money(order.total_price) + '.';\n  var items = itemsPhrase(order.order_details);\n  if (items) line += ' ' + items + '.';\n  if (text(order.created_at)) line += ' It was placed on ' + text(order.created_at) + '.';\n  if (text(order.courier_name)) line += ' The courier is ' + text(order.courier_name) + '.';\n  if (text(order.tracking_number)) line += ' The tracking number is ' + speakDigits(order.tracking_number) + '.';\n  if (text(order.courier_status) && text(order.courier_status).toLowerCase() !== status.toLowerCase()) {\n    line += ' The courier status is ' + text(order.courier_status) + '.';\n  }\n  line += ' The order id on screen is ' + orderId + '.';\n  return line;\n}\n\nfunction speakMany(orders) {\n  var lines = (orders || []).map(function (order) {\n    var item = itemLabel(order.order_details) || 'An item';\n    return speakOrderId(order.order_number) + ', ' + item + ', is ' + (text(order.status) || 'unknown');\n  }).filter(Boolean);\n  return 'I found ' + lines.length + ' orders. ' + lines.join('. ') + '. Please say which order id you mean.';\n}\n\nfunction bodyOf(raw) {\n  if (raw.body && typeof raw.body === 'object' && !Array.isArray(raw.body)) return raw.body;\n  return raw;\n}\n\nfunction withUi(result, order) {\n  if (!order) return result;\n  var packed = wrapOrdersUi([buildUi(order)]);\n  var payload = {\n    found: result.found,\n    speak: result.speak,\n    order_name: result.order_name || packed.ui.orders[0].order_number,\n    action: result.action || '',\n    ui: packed.ui,\n    table_markdown: packed.table_markdown,\n    ui_json: packed.ui_json\n  };\n  return Object.assign({}, result, {\n    bodyText: JSON.stringify(payload),\n    ui: packed.ui,\n    table_markdown: packed.table_markdown,\n    ui_json: packed.ui_json,\n    order_name: payload.order_name\n  });\n}\n\nfunction readResult(raw, request) {\n  var body = bodyOf(raw);\n  if (raw.error || (raw.statusCode && Number(raw.statusCode) >= 400) || body.non_field_errors) {\n    if (body.non_field_errors) {\n      return respond(400, false, 'I need exactly 7 digits of the order number.', request);\n    }\n    return respond(502, false, 'The order desk could not reach the order service.', request);\n  }\n  var orders = Array.isArray(body.orders) ? body.orders : [];\n  var count = Number(body.count);\n  var many = (Number.isFinite(count) && count > 1) || orders.length > 1;\n  if (body.success === false || orders.length === 0) {\n    return respond(200, false, 'That order is not on the desk.', request);\n  }\n  if (many) {\n    var orderUis = (orders || []).map(buildUi).filter(function (orderUi) {\n      return orderUi.order_number;\n    });\n    var choices = orderUis.map(function (orderUi) {\n      return {\n        order_number: orderUi.order_number,\n        item: (orderUi.products[0] && orderUi.products[0].name) || '',\n        status: orderUi.status\n      };\n    });\n    var speak = speakMany(orders);\n    var packed = wrapOrdersUi(orderUis, { choices: choices });\n    var payload = {\n      found: true,\n      speak: speak,\n      order_name: '',\n      action: request.action || '',\n      choices: choices,\n      ui: packed.ui,\n      table_markdown: packed.table_markdown,\n      ui_json: packed.ui_json\n    };\n    return {\n      httpStatus: 200,\n      bodyText: JSON.stringify(payload),\n      found: true,\n      speak: speak,\n      order_name: '',\n      action: payload.action,\n      choices: choices,\n      ui: packed.ui,\n      table_markdown: packed.table_markdown,\n      ui_json: packed.ui_json\n    };\n  }\n  var order = orders[0];\n  var base = Object.assign(respond(200, true, speakOrder(order), Object.assign({}, request, { order_name: displayOrderId(order.order_number) })), {\n    shopify_status: text(order.status)\n  });\n  return withUi(base, order);\n}\n\nvar request = $('Normalize request').first().json;\nreturn [{ json: readResult($input.first().json, request) }];"
+      },
+      "id": "b3b06856-0495-4eaa-b01c-b8231cc58c2b",
+      "name": "Speak from Ginkgo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10640,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.ginkgo_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $env.GINKGO_AUTH }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "c4c7bd54-cff1-4f36-ae5c-ceee24371034",
+      "name": "Ginkgo before log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        9168,
+        1408
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function text(value) {\n  if (value === undefined || value === null) return '';\n  return String(value).trim();\n}\n\nvar DIGIT_WORDS = {\n  '0': 'zero',\n  '1': 'one',\n  '2': 'two',\n  '3': 'three',\n  '4': 'four',\n  '5': 'five',\n  '6': 'six',\n  '7': 'seven',\n  '8': 'eight',\n  '9': 'nine'\n};\n\nfunction speakDigits(value) {\n  var digits = text(value).replace(/\\D/g, '');\n  if (!digits) return '';\n  return digits.split('').map(function (d) {\n    return DIGIT_WORDS[d] || d;\n  }).join(' ');\n}\n\nfunction stripOrderSuffix(value) {\n  return text(value).replace(/_1$/i, '');\n}\n\nfunction speakOrderId(value) {\n  var cleaned = stripOrderSuffix(value).toUpperCase().replace(/\\s+/g, '');\n  var match = cleaned.match(/^SS-?(\\d+)$/i);\n  var digits = match ? match[1] : cleaned.replace(/\\D/g, '');\n  if (!digits) return text(value);\n  return 'S S dash ' + speakDigits(digits);\n}\n\nfunction displayOrderId(value) {\n  var cleaned = stripOrderSuffix(value).toUpperCase().replace(/\\s+/g, '');\n  var match = cleaned.match(/^SS-?(\\d+)$/i);\n  if (match) return 'SS-' + match[1];\n  var digits = cleaned.replace(/\\D/g, '');\n  return digits ? 'SS-' + digits : stripOrderSuffix(value);\n}\n\nfunction payloadOf(found, speak, extra) {\n  return {\n    found: found,\n    speak: speak,\n    order_name: extra.order_name || '',\n    action: extra.action || ''\n  };\n}\n\nfunction respond(httpStatus, found, speak, extra) {\n  var payload = payloadOf(found, speak, extra || {});\n  return {\n    httpStatus: httpStatus,\n    bodyText: JSON.stringify(payload),\n    found: found,\n    speak: speak,\n    order_name: payload.order_name,\n    action: payload.action\n  };\n}\n\nfunction money(amount) {\n  var number = Number(amount);\n  if (!Number.isFinite(number)) return text(amount);\n  var shown = Math.round(number) === number ? String(Math.round(number)) : number.toFixed(2);\n  return shown + ' rupees';\n}\n\nfunction parseLineItems(details) {\n  var raw = text(details).replace(/\\s+/g, ' ');\n  if (!raw) return [];\n  var chunks = raw.split(/\\s*;\\s*|\\s*\\|\\s*|\\n+/).map(function (part) {\n    return part.trim();\n  }).filter(Boolean);\n  if (chunks.length === 0) chunks = [raw];\n  return chunks.map(function (chunk) {\n    var qty = '';\n    var qtyMatch = chunk.match(/\\bQty\\s*=\\s*([0-9]+(?:\\.[0-9]+)?)/i);\n    if (qtyMatch) qty = qtyMatch[1];\n    var withoutQty = chunk.replace(/\\s*Qty\\s*=\\s*[0-9.]+/gi, '').trim();\n    var sku = '';\n    var skuMatch = withoutQty.match(/(?:^|\\s)-\\s*([A-Z]{1,6}\\d+)\\s*$/i) || withoutQty.match(/\\b([A-Z]{1,6}\\d+)\\s*$/i);\n    if (skuMatch) {\n      sku = skuMatch[1].toUpperCase();\n      withoutQty = withoutQty.replace(/(?:^|\\s)-\\s*[A-Z]{1,6}\\d+\\s*$/i, '').replace(/\\b[A-Z]{1,6}\\d+\\s*$/i, '').trim();\n    }\n    return {\n      name: withoutQty || 'Item',\n      sku: sku,\n      qty: qty\n    };\n  });\n}\n\nfunction itemsPhrase(details) {\n  var items = parseLineItems(details);\n  if (items.length === 0) return '';\n  return items.map(function (item) {\n    var line = item.name;\n    if (item.sku) line += ' ' + item.sku;\n    if (item.qty) line += ', quantity ' + item.qty;\n    return line;\n  }).join('. ');\n}\n\nfunction itemLabel(details) {\n  var items = parseLineItems(details);\n  if (items.length === 0) return '';\n  return items[0].name;\n}\n\nfunction speakOrder(order) {\n  var status = text(order.status) || 'unknown';\n  var line = 'Order ' + speakOrderId(order.order_number);\n  if (text(order.shop_name)) line += ' from ' + text(order.shop_name);\n  line += ' is ' + status + '.';\n  if (text(order.total_price)) line += ' The total is ' + money(order.total_price) + '.';\n  var items = itemsPhrase(order.order_details);\n  if (items) line += ' ' + items + '.';\n  if (text(order.created_at)) line += ' It was placed on ' + text(order.created_at) + '.';\n  if (text(order.courier_name)) line += ' The courier is ' + text(order.courier_name) + '.';\n  if (text(order.tracking_number)) line += ' The tracking number is ' + speakDigits(order.tracking_number) + '.';\n  if (text(order.courier_status) && text(order.courier_status).toLowerCase() !== status.toLowerCase()) {\n    line += ' The courier status is ' + text(order.courier_status) + '.';\n  }\n  return line;\n}\n\nfunction speakMany(orders) {\n  var lines = (orders || []).map(function (order) {\n    var item = itemLabel(order.order_details) || 'An item';\n    return speakOrderId(order.order_number) + ', ' + item + ', is ' + (text(order.status) || 'unknown');\n  }).filter(Boolean);\n  return 'I found ' + lines.length + ' orders. ' + lines.join('. ') + '. Please say which order id you mean.';\n}\n\nfunction bodyOf(raw) {\n  if (raw.body && typeof raw.body === 'object' && !Array.isArray(raw.body)) return raw.body;\n  return raw;\n}\n\nfunction readResult(raw, request) {\n  var body = bodyOf(raw);\n  if (raw.error || (raw.statusCode && Number(raw.statusCode) >= 400) || body.non_field_errors) {\n    if (body.non_field_errors) {\n      return respond(400, false, 'I need exactly 7 digits of the order number.', request);\n    }\n    return respond(502, false, 'The order desk could not reach the order service.', request);\n  }\n  var orders = Array.isArray(body.orders) ? body.orders : [];\n  var count = Number(body.count);\n  var many = (Number.isFinite(count) && count > 1) || orders.length > 1;\n  if (body.success === false || orders.length === 0) {\n    return respond(200, false, 'That order is not on the desk.', request);\n  }\n  if (many) {\n    var speak = speakMany(orders);\n    return {\n      httpStatus: 200,\n      bodyText: JSON.stringify({\n        found: true,\n        speak: speak,\n        order_name: '',\n        action: request.action || ''\n      }),\n      found: true,\n      speak: speak,\n      order_name: '',\n      action: request.action || ''\n    };\n  }\n  var order = orders[0];\n  return Object.assign(respond(200, true, speakOrder(order), Object.assign({}, request, { order_name: displayOrderId(order.order_number) })), {\n    shopify_status: text(order.status)\n  });\n}\n\nvar request = $('Normalize request').first().json;\nvar result = readResult($input.first().json, request);\n\nif (!result.found || !result.order_name) {\n  return [{ json: Object.assign(result, { should_log: false }) }];\n}\n\nvar prefix = 'Logged a ' + request.request_type + ' request for order ' + speakOrderId(result.order_name) + '. The order was not changed.';\nvar logged = respond(200, true, prefix, Object.assign({}, request, { order_name: result.order_name }));\n\nreturn [{\n  json: Object.assign(logged, {\n    should_log: true,\n    sheet_ready: request.sheet_ready,\n    created_at: new Date().toISOString(),\n    request_type: request.request_type,\n    detail: request.detail,\n    shopify_status: result.shopify_status\n  })\n}];"
+      },
+      "id": "ea5da399-ed76-4026-a895-f12829933992",
+      "name": "Resolve log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9392,
+        1408
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a11ce003-0001-4000-8000-000000000009-cond",
+              "leftValue": "={{ $json.should_log }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ed5bf3a9-d315-460f-9d6b-297c3a3d173c",
+      "name": "Should log",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        9616,
+        1408
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a11ce003-0001-4000-8000-000000000010-cond",
+              "leftValue": "={{ $json.sheet_ready }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "462fe388-ea53-4567-ad29-185da1ce0701",
+      "name": "Sheet ready",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        9888,
+        1392
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "requests",
+          "mode": "name",
+          "cachedResultName": "requests"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "created_at": "={{ $json.created_at }}",
+            "order_name": "={{ $json.order_name }}",
+            "request_type": "={{ $json.request_type }}",
+            "detail": "={{ $json.detail }}",
+            "shopify_status": "={{ $json.shopify_status }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "order_name",
+              "displayName": "order_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "request_type",
+              "displayName": "request_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "detail",
+              "displayName": "detail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "shopify_status",
+              "displayName": "shopify_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a09a0248-36e3-4ded-9383-5c3829d068fe",
+      "name": "Append request",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        10192,
+        1168
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "74cNr9vLf4RuLpmL",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function from(name) {\n  try {\n    const item = $(name).first();\n    if (item && item.json && item.json.bodyText) return item.json;\n  } catch (error) {}\n  return null;\n}\nreturn [{ json: from('Resolve log') }];"
+      },
+      "id": "fca3cf97-18e5-42fe-9728-e9d8e295e862",
+      "name": "Keep log response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10448,
+        1168
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst payload = {\n  found: false,\n  speak: 'The request log is not configured yet.',\n  order_name: item.order_name || '',\n  action: 'log_request'\n};\nreturn [{ json: { httpStatus: 500, bodyText: JSON.stringify(payload) } }];"
+      },
+      "id": "a72a31bc-b453-427f-ace5-37e6ca4cd960",
+      "name": "Sheet not configured",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10368,
+        1408
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const request = $('Normalize request').first().json;\nconst payload = {\n  found: false,\n  speak: 'The order desk could not understand that request.',\n  order_name: request.order_name || '',\n  action: request.action || ''\n};\nreturn [{ json: { httpStatus: 400, bodyText: JSON.stringify(payload) } }];"
+      },
+      "id": "9898c3c9-766e-4ec1-8098-66bc2d289d28",
+      "name": "Unknown action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9168,
+        1632
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.bodyText }}",
+        "options": {
+          "responseCode": "={{ $json.httpStatus }}"
+        }
+      },
+      "id": "b29a7145-688c-4265-9f17-90fd4552afb9",
+      "name": "Respond to webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        10832,
+        1920
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize request": {
+      "main": [
+        [
+          {
+            "node": "Request allowed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request allowed": {
+      "main": [
+        [
+          {
+            "node": "Route action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route action": {
+      "main": [
+        [
+          {
+            "node": "Ginkgo lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ginkgo before log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ginkgo lookup": {
+      "main": [
+        [
+          {
+            "node": "Speak from Ginkgo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Speak from Ginkgo": {
+      "main": [
+        [
+          {
+            "node": "Respond to webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ginkgo before log": {
+      "main": [
+        [
+          {
+            "node": "Resolve log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve log": {
+      "main": [
+        [
+          {
+            "node": "Should log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should log": {
+      "main": [
+        [
+          {
+            "node": "Sheet ready",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheet ready": {
+      "main": [
+        [
+          {
+            "node": "Append request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet not configured",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append request": {
+      "main": [
+        [
+          {
+            "node": "Keep log response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep log response": {
+      "main": [
+        [
+          {
+            "node": "Respond to webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheet not configured": {
+      "main": [
+        [
+          {
+            "node": "Respond to webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unknown action": {
+      "main": [
+        [
+          {
+            "node": "Respond to webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "cc77bdf7-7841-40ab-912b-22285ce363a9",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3de08d83541527f2b94c2b95e7475895c38884fad07a4a4b691d45a6c09572a4"
+  },
+  "nodeGroups": [],
+  "id": "J3p5ckvpkp15gCc7",
+  "tags": []
+}

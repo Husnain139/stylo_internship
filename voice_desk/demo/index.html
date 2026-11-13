@@ -70,17 +70,21 @@
     }
 
     #order-panel {
+      /* Docked just left of ElevenLabs launcher */
+      --el-launcher-w: 300px;
+      --dock-gap: 10px;
       position: fixed;
-      right: 20px;
-      bottom: 108px;
-      z-index: 40;
-      width: min(380px, calc(100vw - 32px));
-      max-height: min(60vh, 520px);
+      left: auto;
+      right: calc(var(--el-launcher-w) + var(--dock-gap));
+      bottom: 18px;
+      z-index: 2147483000;
+      width: min(360px, calc(100vw - var(--el-launcher-w) - var(--dock-gap) - 24px));
+      max-height: min(56vh, 480px);
       overflow: auto;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 16px;
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.14);
       padding: 14px 16px 16px;
     }
 
@@ -196,8 +200,8 @@
 
     @media (max-width: 520px) {
       #order-panel {
-        right: 12px;
         left: 12px;
+        right: 12px;
         width: auto;
         bottom: 100px;
       }

@@ -1,0 +1,21 @@
+; Render with ../render-config.sh after filling ../.env
+; Inbound from PBX → ElevenLabs; on failure → PBX fallback extension
+
+[general]
+static=yes
+writeprotect=no
+
+[from-pbx]
+; Set AI_DID_PATTERN in .env (e.g. _X. for any, or a concrete DID)
+exten => __AI_DID_PATTERN__,1,NoOp(Stylo bridge inbound from PBX ${CALLERID(all)} did=${EXTEN})
+ same => n,Set(EL_DEST=__EL_DEST__)
+ same => n,Dial(PJSIP/${EL_DEST}@elevenlabs,60,g)
+ same => n,GotoIf($["${DIALSTATUS}" = "ANSWER"]?hang:fallback)
+ same => n(fallback),NoOp(ElevenLabs failed status=${DIALSTATUS} → fallback __FALLBACK_EXT__)
+ same => n,Dial(PJSIP/__FALLBACK_EXT__@pbx,45)
+ same => n(hang),Hangup()
+
+[from-elevenlabs]
+; Inbound-only v1: ignore unexpected legs from EL
+exten => _X.,1,NoOp(Unexpected inbound from ElevenLabs ${EXTEN})
+ same => n,Hangup()

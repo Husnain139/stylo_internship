@@ -1,0 +1,46 @@
+--Setup--
+On-Premisis Data Gateway installation and setup in both PC and MS Fabric. Setting of MS Fabric (not workspace) --> Manage Connections and Gateways --> On-premisis Gateways --> Connections
+
+--Ingestion aka Bronze Layer--
+things are overwriting
+Made 2 Lakehouses and 1 Warehouse
+Ran SQl Query inside warehouse to make 'dbo.ETL_Log' (its a error diary for the Gold load suggested by AI. LogID is filled in by the warehouse. The other columns store which procedure failed, the SQL error number, the message, the line, and the time. Nothing writes here until a load fails. If the Gold procedure rolls back, this table is how you can still see what went wrong.) 
+and 'dbo.ingest_watermark' (also suggested by AI. it remembers how far the last successful copy got. One row per table, for Sales.SalesOrderHeader and Sales.SalesOrderDetail only. WatermarkValue is the latest ModifiedDate already copied. A later incremental run copies only rows newer than that. The first run is a full overwrite, so this table stays empty until you deliberately choose incremental.)
+'dbo.ETL_Log' has LogID (bigint; A number the warehouse assigns to each error row, so the rows stay in order), ProcedureName (varchar 128; Which procedure failed. For this project that is dbo.usp_Load_Gold.), ErrorNumber (int; The SQL Server error code, such as a duplicate key or a missing object.), ErrorMessage (varchar 4000; The text of that error, readable without opening the pipeline log.), ErrorLine (int; The line inside the procedure where the statement failed.), LoggedAt (datetime2; When the error was written.)
+'dbo.ingest_watermark' has SchemaName (varchar 128; Source schema of the table being copied. Here it will be Sales.), TableName (varchar 128; Source table. Only SalesOrderHeader or SalesOrderDetail.), WatermarkColumn (varchar 128; Which column marks “already copied.” For both tables that is ModifiedDate.), WatermarkValue (datetime2; The latest ModifiedDate successfully copied. The next incremental run takes rows newer than this.), UpdatedAt (datetime2; When that watermark was last saved.)
+A full run does not need ingest_watermark. An incremental run does. ETL_Log stays empty on a successful load.
+
+                int:            bigint:
+Storage Size	4 bytes	        8 bytes
+Minimum Value	-2,147,483,648	-9,223,372,036,854,775,808
+Maximum Value	2,147,483,647	9,223,372,036,854,775,807
+
+Made pipeline, it has 'lookup activity' and 'foreach activity' with 'copy data activity' inside it. The output of 'lookup activity' is input of 'for each activity' such that there were two outputs, i.e count and values. count was used by for each to iterate and values were used by copy data activity inside foreach activity.
+'lookup activity' has query which is used to fetch both dest and source schemas, dest and source tables, source_query (for copy data functionality; The script builds source_query from sys.columns instead of using SELECT * but changed data types of some columns as delta tables didnt supported them like TimeSpan), primary keys, is_core (1 if gold or silver uses it, 0 if bronze keeps it), load_strategy(watermark for Sales.SalesOrderHeader and Sales.SalesOrderDetail means it will upsert; full i.e overwrite for other 67 tables), watermark_column (ModifiedDate) and counts of tables
+
+'for each' runs on the base of 'count' and it is given 'value' as input.
+copy jobs gets 'value', it then uses 'value.@item(dynamic var).source_query' to copy table from sql server to lakehouse and value.@item.dest_schema and value.@item.dest_table as destination of copy data activity
+
+writing mode is 'overwrite' for copy data and it has retry policy of 2 with interval of 30 seconds and timeout of 15 mins.
+changed data types of several columns as delta tables didnt support them as 'time' as it has TimeSpan, xml columns to text, 'hierarchyid' to text, 'geography' to text. phhotos and docs were left out.
+
+--Silver Layer--
+now, for silver layer, we used pyspark notebook to get tables of bronze and convert them to silver tables by merging different bronze tables.
+main schema is 'cleansed'. enabled vorder(make faster parquet tables, writing is 15% slow, good for one time writes), optimizeWrite(bundles in-memory data into well-sized bins before writing Parquet files to storage, rather than making thousands of tiny files to avoid degradion of downstream read and query performance. writing is 15% slow), spark_native(for faster sql queries in notebook as they are processed by meta velox and intel apache gluten) for performance boost.
+things are overwriting
+these three above pyspark configs are best for powerbi reading. these are best for silver layer or gold layer, rather than bronze layer. also, they consume cus. not worthh it, if data is one time read only.
+then i made 'address df' for future refernces of address. made date table from salesorderheader.orderdate, transactionhistory.transactiondate, transactionhistoryarchive.transactiondate.
+then i made salesorderheader table from sales.salesorderheader. converted money to dec (19 total digits, 4 after decimal point). 
+then i made SalesOrderDetail from sales.SalesOrderDetail. same as above
+then i made Customer from sales.Customer. 
+then i made SalesTerritory from sales.SalesTerritory. 
+then i made Person from person.Person, and join via person.EmailAddress (removed mutiple emails associated with single person, took only first one. to take last one, use order by .desc on modifieddate and emailaddressid), Person.PersonPhone, Person.PersonPhoneType; same procedure as email, Person.BusinessEntityAddress, Person.AddressType (selects top according to priority, and priority is given to primary address) and addressdf. pre-process text columns too.
+then i made store from sales.store and join via Person.BusinessEntityAddress where address is 3 and addressdf. 
+then i made product from Production.Product and join via Production.ProductSubcategory, Production.ProductCategory, Production.UnitMeasure. 
+then i made ProductCostHistory from production.ProductCostHistory. 
+then i made InventoryMovement table (most important table for stock fact) from Production.TransactionHistory and Production.TransactionHistoryArchive. 
+at the end, there are checks that only compare rows of bronze and silver that weather they are same or not.
+
+--Gold Layer--
+now, we build the gold layer in data warehouse using tsql transaction named . we make facts and dims by using different columns of different tables from the silver lakehouse.
+main schema is 'dbo' while 'stg' is used for playground schema. where all pre-processing happens.

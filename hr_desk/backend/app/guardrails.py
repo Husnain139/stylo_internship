@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import re #regular expressions
 from dataclasses import dataclass
 
 from .config import EMPTY_QUESTION, MAX_USER_CHARS, REFUSAL, TOO_LONG

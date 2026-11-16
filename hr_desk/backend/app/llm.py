@@ -1,4 +1,4 @@
-"""Model calls. The stub answers from the passages and does not spend API money."""
+"""Model calls."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from .config import (
     TIMEOUT_MODERATION_S,
     embed_model,
 )
-from .grounded import draft_from_passages
 from .guardrails import moderation_blocks
 from .models import Completion, Passage
 from .prompting import user_message
@@ -30,57 +29,6 @@ _REWRITE_SYSTEM = (
     "If the topic changed, ignore the earlier turns. "
     "Reply with the question only."
 )
-
-
-class StubLLM:
-    def __init__(self) -> None:
-        self.calls = {"answer": 0, "classify": 0, "rewrite": 0, "moderate": 0}
-
-    def moderate(self, text: str) -> bool:
-        self.calls["moderate"] += 1
-        return False
-
-    def classify(self, text: str) -> str:
-        self.calls["classify"] += 1
-        return "block"
-
-    def rewrite(self, question: str, history: list[dict]) -> str:
-        self.calls["rewrite"] += 1
-        prior = ""
-        for turn in reversed(history):
-            if turn.get("role") == "user":
-                prior = (turn.get("text") or "").strip()
-                break
-        if prior:
-            return f"{question} {prior}".strip()
-        return question
-
-    def answer(
-        self,
-        *,
-        system: str,
-        question: str,
-        background: str,
-        passages: list[Passage],
-        model: str,
-        max_tokens: int,
-    ) -> Completion:
-        self.calls["answer"] += 1
-        return Completion(
-            text=draft_from_passages(question, passages),
-            tokens_in=0,
-            tokens_out=0,
-            model=model,
-        )
-
-
-class DirtyLLM(StubLLM):
-    """Test double that tries to leak a chunk tag, a link, and a made-up number."""
-
-    def answer(self, **kwargs) -> Completion:
-        completion = super().answer(**kwargs)
-        completion.text += " See [chunk_4_doc_23]. Visit http://evil.example/secret. The CEO earns 999999."
-        return completion
 
 
 def _parameter_rejected(exc: Exception) -> bool:
@@ -172,12 +120,16 @@ class OpenAIBackend:
         passages: list[Passage],
         model: str,
         max_tokens: int,
+        designation: str = "",
     ) -> Completion:
         text, tokens_in, tokens_out = self._chat(
             model=model,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": user_message(question, background, passages)},
+                {
+                    "role": "user",
+                    "content": user_message(question, background, passages, designation),
+                },
             ],
             max_tokens=max_tokens,
             temperature=TEMPERATURE_ANSWER,

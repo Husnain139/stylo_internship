@@ -11,8 +11,8 @@ from pathlib import Path
 import yaml
 
 from app.config import openai_api_key
-from app.factory import memory_pipeline, sync_samples
-from app.llm import DirtyLLM
+from app.factory import build_pipeline
+from app.pipeline import Pipeline
 from app.sanitize import sanitize
 from app.store_memory import MemoryStore
 
@@ -35,45 +35,36 @@ def load_cases() -> list[dict]:
     return list(data)
 
 
+def _offline_pipeline() -> Pipeline:
+    """Guard checks stop before search, so they do not need a model or embeddings."""
+    store = MemoryStore()
+    store.add_employee("sara.intern@stylo.example", "Sara", "intern", False)
+    return Pipeline(store, None, None)
+
+
 def run_deterministic() -> list[Check]:
-    pipeline = memory_pipeline()
+    pipeline = _offline_pipeline()
     checks: list[Check] = []
     for case in load_cases():
-        kind = case.get("kind")
-        if kind == "sanitize":
+        if case.get("kind") == "sanitize":
             checks.append(_sanitize_case(case))
-        elif kind == "dirty":
-            checks.append(_dirty_case(case))
-        elif kind == "steps":
-            checks.append(_steps_case(case))
-        else:
-            checks.append(_ask_case(pipeline, case))
+            continue
+        checks.append(_ask_case(pipeline, case))
     return checks
 
 
 def run_live() -> list[Check]:
-    from openai import OpenAI
-
-    from app.llm import OpenAIBackend
-    from app.pipeline import Pipeline
-
-    client = OpenAI(api_key=openai_api_key())
-    backend = OpenAIBackend(client)
-    store = MemoryStore()
-    sync_samples(store, backend)
-    pipeline = Pipeline(store, backend, backend)
+    pipeline = build_pipeline()
     case = {
-        "id": "live_leave",
-        "name": "A live answer about leave stays inside the policy",
+        "id": "live_summary",
+        "name": "A live answer about the summary report stays inside the policy",
         "primary": True,
         "email": "ali.employee@stylo.example",
-        "question": "How many annual leave days do I get?",
+        "question": "give me details about summart report",
         "expect": {
             "outcome": "answered",
-            "citation_has": "Leave policy, Annual leave",
-            "answer_must_contain": ["18"],
-            "answer_must_not_contain": ["12"],
-            "numbers_grounded": True,
+            "passage_must_contain": ["Inquiry officer findings"],
+            "answer_must_not_contain": ["warning letter"],
             "model_called": True,
         },
     }
@@ -144,7 +135,7 @@ def main() -> int:
 def _employee(pipeline, email: str):
     person = pipeline.store.employee(email)
     if person is None:
-        raise RuntimeError(f"Unknown practice person: {email}")
+        raise RuntimeError(f"This email is not on the employee list: {email}")
     return person
 
 
@@ -190,30 +181,11 @@ def _ask(pipeline, case: dict):
     return result, trace
 
 
-def _steps_case(case: dict) -> Check:
-    pipeline = memory_pipeline()
-    for step in case["steps"]:
-        merged = {**case, **step}
-        _result, _trace, detail = _run_question(pipeline, merged)
-        if detail:
-            return _failed(case, detail)
-    return _passed(case)
-
-
 def _sanitize_case(case: dict) -> Check:
     cleaned = sanitize(case["draft"], [case["passage"]])
     detail = _text_rules(cleaned, case)
     if "http" in case.get("answer_must_not_contain", []) and "http" in cleaned:
         detail = detail or "An invented link was still in the answer."
-    return _failed(case, detail) if detail else _passed(case)
-
-
-def _dirty_case(case: dict) -> Check:
-    pipeline = memory_pipeline(llm=DirtyLLM())
-    result, trace = _ask(pipeline, case)
-    detail = _text_rules(result.answer, case)
-    if trace.model is None:
-        detail = detail or "The draft was not cleaned on the answer path."
     return _failed(case, detail) if detail else _passed(case)
 
 
@@ -249,6 +221,13 @@ def _expect_detail(expect: dict, result, trace) -> str:
         labels = " ".join(item.label for item in result.citations)
         if expect["citation_has"] not in labels:
             return f"Sources were: {labels or 'none'}"
+    passage_text = "\n".join(item.text for item in result.citations)
+    for needed in expect.get("passage_must_contain") or []:
+        if str(needed).lower() not in passage_text.lower():
+            return f"The policy text did not include {needed}."
+    for banned in expect.get("passage_must_not_contain") or []:
+        if str(banned).lower() in passage_text.lower():
+            return f"The policy text included {banned}."
     text_detail = _text_rules(result.answer, {"answer_must_contain": expect.get("answer_must_contain"), "answer_must_not_contain": expect.get("answer_must_not_contain")})
     if text_detail:
         return text_detail

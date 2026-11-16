@@ -13,9 +13,9 @@ The screen is for employees and HR. It does not show models, scores, or internal
 5. Remove invented links, chunk tags, and numbers that are not in the policy.
 6. Save a trace HR can read in plain language.
 
-PDF and Word files in `backend/data/policies` are loaded when the API starts. A file is skipped when its text cannot be read. Everyone can ask about the ones that loaded. The checks still use the separate sample policies in `backend/data/sample_policies`. The screen says the library is sample-only when those are the only policies loaded.
+PDF and Word files in `backend/data/policies` are the live library. They are read in document order when the API starts: one passage for a short section, one passage for each table row (with the column headers repeated), and a transcription for a picture that contains words. Logos and the advance-salary login picture are not passages. A scan such as the travel policy is transcribed page by page.
 
-Access, until the company hierarchy is confirmed: an intern sees company-wide policies and intern policies. A manager sees company-wide policies and manager policies, not the intern handbook and not HR salary bands. HR can see and manage every policy. Practice sign-in uses five sample people. Company OAuth can later use the same email lookup.
+Sign-up and sign-in each ask for email and password. The email must already be on the employee list, and the password is stored as a salted hash. Name, designation, and admin status are read from the employees table. The API does not write that table. Policies, Questions people asked, and Checks are shown only when that person is an admin. Adding a person later is a new row.
 
 ## Run it
 
@@ -49,6 +49,4 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000.
-
-Without Docker, set `HR_DESK_STORE=memory` in `.env` and leave `DATABASE_URL` empty. The same checks still run. Postgres is the store to use when Docker is available.
+Open http://localhost:3000. Postgres must be running. The API reads `DATABASE_URL` and `OPENAI_API_KEY` from `.env`.

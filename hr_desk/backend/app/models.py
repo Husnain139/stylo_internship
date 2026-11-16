@@ -11,6 +11,7 @@ class Employee:
     email: str
     name: str
     designation: str
+    is_admin: bool = False
 
 
 @dataclass
@@ -20,8 +21,9 @@ class PolicyDraft:
     audience: str
     effective_from: date
     effective_to: date | None
-    sample: bool
     body: str
+    chunks: list["ChunkDraft"] | None = None
+    source_name: str = ""
 
 
 @dataclass
@@ -30,6 +32,11 @@ class ChunkDraft:
     heading: str
     body: str
     embed_text: str
+    heading_path: str = ""
+    content_type: str = "section"
+    page: int | None = None
+    image_path: str = ""
+    polarity: str = ""
 
 
 @dataclass
@@ -46,12 +53,18 @@ class Passage:
     vec_score: float = 0.0
     kw_score: float = 0.0
     score: float = 0.0
+    heading_path: str = ""
+    content_type: str = "section"
+    page: int | None = None
+    image_path: str = ""
+    polarity: str = ""
 
 
 @dataclass(frozen=True)
 class Citation:
     label: str
     text: str
+    image: str = ""
 
 
 @dataclass

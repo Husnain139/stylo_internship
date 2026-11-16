@@ -1,4 +1,4 @@
-"""In-memory store used by tests and by local runs without Docker."""
+"""In-memory store for checks that stop before search. The live app uses Postgres."""
 
 from __future__ import annotations
 
@@ -8,28 +8,40 @@ import secrets
 import threading
 from datetime import date, datetime, timezone
 
-from .access import PEOPLE, allowed_audiences
 from .embeddings import cosine
 from .models import ChunkDraft, Employee, Passage, PolicyDraft, TraceRecord
+from .textutil import keyword_score
 
 
 class MemoryStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.employees = {
-            email: Employee(email, name, designation) for email, name, designation in PEOPLE
-        }
+        self.employees: dict[str, Employee] = {}
+        self.password_hashes: dict[str, str] = {}
         self.sessions: dict[str, str] = {}
         self.policies: dict[str, PolicyDraft] = {}
         self.chunks: list[dict] = []
         self.cache: list[dict] = []
         self.traces: dict[str, TraceRecord] = {}
 
+    def add_employee(self, email: str, name: str, designation: str, is_admin: bool = False) -> None:
+        self.employees[email] = Employee(email, name, designation, is_admin)
+
     def employee(self, email: str) -> Employee | None:
         return self.employees.get(email)
 
-    def people(self) -> list[Employee]:
-        return list(self.employees.values())
+    def password_hash(self, email: str) -> str | None:
+        return self.password_hashes.get(email) or None
+
+    def set_password(self, email: str, password_hash: str) -> bool:
+        if email not in self.employees or self.password_hashes.get(email):
+            return False
+        self.password_hashes[email] = password_hash
+        return True
+
+    def delete_session(self, token: str) -> None:
+        with self._lock:
+            self.sessions.pop(token or "", None)
 
     def create_session(self, email: str) -> str:
         with self._lock:
@@ -42,19 +54,6 @@ class MemoryStore:
         if not email:
             return None
         return self.employees.get(email)
-
-    def delete_samples_except(self, keep_ids: set[str]) -> None:
-        with self._lock:
-            removed = {
-                policy_id
-                for policy_id, policy in self.policies.items()
-                if policy.sample and policy_id not in keep_ids
-            }
-            for policy_id in removed:
-                self.policies.pop(policy_id, None)
-            self.chunks = [chunk for chunk in self.chunks if chunk["policy_id"] not in removed]
-            if removed:
-                self.cache.clear()
 
     def delete_docs_except(self, keep_ids: set[str]) -> None:
         with self._lock:
@@ -71,6 +70,15 @@ class MemoryStore:
 
     def has_policy(self, policy_id: str) -> bool:
         return policy_id in self.policies
+
+    def delete_policy(self, policy_id: str) -> bool:
+        with self._lock:
+            if policy_id not in self.policies:
+                return False
+            self.policies.pop(policy_id, None)
+            self.chunks = [chunk for chunk in self.chunks if chunk["policy_id"] != policy_id]
+            self.cache.clear()
+            return True
 
     def insert_policy(
         self,
@@ -93,6 +101,11 @@ class MemoryStore:
                         "body": chunk.body,
                         "embed_text": chunk.embed_text,
                         "embedding": vector,
+                        "heading_path": chunk.heading_path,
+                        "content_type": chunk.content_type,
+                        "page": chunk.page,
+                        "image_path": chunk.image_path,
+                        "polarity": chunk.polarity,
                         "audience": policy.audience,
                         "effective_from": policy.effective_from,
                         "effective_to": policy.effective_to,
@@ -102,9 +115,6 @@ class MemoryStore:
 
     def list_policies(self) -> list[PolicyDraft]:
         return list(self.policies.values())
-
-    def has_samples(self) -> bool:
-        return any(policy.sample for policy in self.policies.values())
 
     def policy_version(self) -> str:
         payload = []
@@ -138,8 +148,13 @@ class MemoryStore:
                 continue
             if chunk["effective_to"] and chunk["effective_to"] < today:
                 continue
-            found.append(_passage(chunk, cosine(embedding, chunk["embedding"])))
-        found.sort(key=lambda passage: passage.vec_score, reverse=True)
+            passage = _passage(chunk, cosine(embedding, chunk["embedding"]))
+            passage.kw_score = keyword_score(
+                query,
+                f"{chunk['section_label']} {chunk.get('heading_path', '')} {chunk['heading']} {chunk['body']}",
+            )
+            found.append(passage)
+        found.sort(key=lambda passage: (0.65 * max(passage.vec_score, 0.0) + 0.35 * passage.kw_score), reverse=True)
         return found[:limit]
 
     def cache_lookup(
@@ -188,6 +203,11 @@ def _passage(chunk: dict, vec_score: float) -> Passage:
         effective_from=chunk["effective_from"],
         effective_to=chunk["effective_to"],
         vec_score=vec_score,
+        heading_path=chunk.get("heading_path", ""),
+        content_type=chunk.get("content_type", "section"),
+        page=chunk.get("page"),
+        image_path=chunk.get("image_path", ""),
+        polarity=chunk.get("polarity", ""),
     )
 
 

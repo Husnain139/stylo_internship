@@ -33,7 +33,7 @@ class Pipeline:
         self.store = store
         self.embedder = embedder
         self.llm = llm
-        self.today = today or date.today
+        self.today = today or date.today #trace
 
     def ask(self, employee: Employee, question: str, history: list[dict] | None = None) -> AskResult:
         started = time.perf_counter()
@@ -99,7 +99,8 @@ class Pipeline:
                 state["outcome"] = cached["outcome"]
                 state["answer"] = cached["answer"]
                 state["citations"] = [
-                    Citation(item["label"], item["text"]) for item in (cached["citations"] or [])
+                    Citation(item["label"], item["text"], item.get("image") or "")
+                    for item in (cached["citations"] or [])
                 ]
                 state["sections"] = [item.label for item in state["citations"]]
                 return self._finish(employee, question, state, started)
@@ -125,6 +126,7 @@ class Pipeline:
                     passages=chosen,
                     model=model,
                     max_tokens=answer_max_tokens(model),
+                    designation=employee.designation,
                 )
                 state["model"] = model
                 state["tokens_in"] = completion.tokens_in
@@ -145,6 +147,12 @@ class Pipeline:
                     [passage.body for passage in chosen],
                     allowed_numbers,
                 )
+                missed = "I couldn't find this in the policies I can open."
+                if missed in answer and answer.strip() not in {UNKNOWN, missed}:
+                    answer = " ".join(answer.replace(missed, "").replace(UNKNOWN, "").split())
+                detailed = next((passage for passage in chosen if passage.content_type in {"form", "table"}), None)
+                if detailed and len(answer) < 120:
+                    answer = detailed.body[:1500]
                 if answer == REFUSAL:
                     state["outcome"] = "refused"
                     state["answer"] = REFUSAL
@@ -154,7 +162,7 @@ class Pipeline:
                 else:
                     state["outcome"] = "answered"
                     state["answer"] = answer
-                    state["citations"] = [Citation(passage.section_label, passage.body) for passage in chosen]
+                    state["citations"] = [_citation(passage) for passage in chosen]
             else:
                 everywhere = search_passages(
                     self.store,
@@ -182,7 +190,8 @@ class Pipeline:
                         "question": state["rewritten_question"],
                         "answer": state["answer"],
                         "citations": [
-                            {"label": item.label, "text": item.text} for item in state["citations"]
+                            {"label": item.label, "text": item.text, "image": item.image}
+                            for item in state["citations"]
                         ],
                         "outcome": state["outcome"],
                     }
@@ -238,6 +247,13 @@ class Pipeline:
             logger.exception("Could not store the question trace")
         shown = trace.citations if state["outcome"] == "answered" else []
         return AskResult(trace.answer, state["outcome"], shown, trace.id)
+
+
+def _citation(passage) -> Citation:
+    image = ""
+    if passage.image_path:
+        image = "|".join(f"/api/media/{path}" for path in passage.image_path.split("|") if path)
+    return Citation(passage.section_label, passage.body, image)
 
 
 def plain_steps(

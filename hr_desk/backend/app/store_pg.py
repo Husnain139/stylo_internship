@@ -10,9 +10,7 @@ from datetime import date, datetime
 
 from psycopg.types.json import Jsonb
 
-from .access import PEOPLE
 from .models import ChunkDraft, Employee, Passage, PolicyDraft, TraceRecord
-from .store_memory import utc_now
 
 _SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -35,8 +33,8 @@ CREATE TABLE IF NOT EXISTS policies (
   audience TEXT NOT NULL,
   effective_from DATE NOT NULL,
   effective_to DATE,
-  sample BOOLEAN NOT NULL,
-  body TEXT NOT NULL
+  body TEXT NOT NULL,
+  source_name TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS policy_chunks (
@@ -95,7 +93,7 @@ class PostgresStore:
             self.conn = psycopg.connect(dsn, connect_timeout=5)
         except Exception as exc:
             raise RuntimeError(
-                "Could not connect to Postgres. Start Docker, or set HR_DESK_STORE=memory."
+                "Could not connect to Postgres. Start Docker and check DATABASE_URL."
             ) from exc
         # Stay in autocommit. A bare query otherwise opens a transaction, and the
         # next transaction() block only releases a savepoint inside it, so writes
@@ -127,21 +125,41 @@ class PostgresStore:
                 ON policy_chunks USING gin (search_text)
                 """
             )
-            for email, name, designation in PEOPLE:
-                cur.execute(
-                    """
-                    INSERT INTO employees (email, name, designation)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (email) DO UPDATE
-                    SET name = EXCLUDED.name, designation = EXCLUDED.designation
-                    """,
-                    (email, name, designation),
-                )
+            cur.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS password_hash TEXT")
+            cur.execute(
+                "ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            cur.execute(
+                "ALTER TABLE policy_chunks ADD COLUMN IF NOT EXISTS heading_path TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE policy_chunks ADD COLUMN IF NOT EXISTS content_type TEXT NOT NULL DEFAULT 'section'"
+            )
+            cur.execute("ALTER TABLE policy_chunks ADD COLUMN IF NOT EXISTS page INTEGER")
+            cur.execute(
+                "ALTER TABLE policy_chunks ADD COLUMN IF NOT EXISTS image_path TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE policy_chunks ADD COLUMN IF NOT EXISTS polarity TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE policies ADD COLUMN IF NOT EXISTS source_name TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'policies' AND column_name = 'sample'
+                """
+            )
+            if cur.fetchone():
+                cur.execute("DELETE FROM policies WHERE sample = TRUE OR id LIKE 'sample-%%'")
+                cur.execute("DELETE FROM answer_cache")
+                cur.execute("ALTER TABLE policies DROP COLUMN sample")
 
     def employee(self, email: str) -> Employee | None:
         with self._lock, self.conn.cursor() as cur:
             cur.execute(
-                "SELECT email, name, designation FROM employees WHERE email = %s",
+                "SELECT email, name, designation, is_admin FROM employees WHERE email = %s",
                 (email,),
             )
             row = cur.fetchone()
@@ -149,10 +167,29 @@ class PostgresStore:
             return None
         return Employee(*row)
 
-    def people(self) -> list[Employee]:
+    def password_hash(self, email: str) -> str | None:
         with self._lock, self.conn.cursor() as cur:
-            cur.execute("SELECT email, name, designation FROM employees ORDER BY name")
-            return [Employee(*row) for row in cur.fetchall()]
+            cur.execute("SELECT password_hash FROM employees WHERE email = %s", (email,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        return row[0] or None
+
+    def set_password(self, email: str, password_hash: str) -> bool:
+        with self._lock, self.conn.cursor() as cur, self.conn.transaction():
+            cur.execute(
+                """
+                UPDATE employees
+                SET password_hash = %s
+                WHERE email = %s AND (password_hash IS NULL OR password_hash = '')
+                """,
+                (password_hash, email),
+            )
+            return cur.rowcount == 1
+
+    def delete_session(self, token: str) -> None:
+        with self._lock, self.conn.cursor() as cur, self.conn.transaction():
+            cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
 
     def create_session(self, email: str) -> str:
         token = secrets.token_urlsafe(32)
@@ -167,7 +204,7 @@ class PostgresStore:
         with self._lock, self.conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT e.email, e.name, e.designation
+                SELECT e.email, e.name, e.designation, e.is_admin
                 FROM sessions s
                 JOIN employees e ON e.email = s.email
                 WHERE s.token = %s
@@ -178,18 +215,6 @@ class PostgresStore:
         if not row:
             return None
         return Employee(*row)
-
-    def delete_samples_except(self, keep_ids: set[str]) -> None:
-        with self._lock, self.conn.cursor() as cur, self.conn.transaction():
-            if keep_ids:
-                cur.execute(
-                    "DELETE FROM policies WHERE sample = TRUE AND NOT (id = ANY(%s))",
-                    (list(keep_ids),),
-                )
-            else:
-                cur.execute("DELETE FROM policies WHERE sample = TRUE")
-            if cur.rowcount:
-                cur.execute("DELETE FROM answer_cache")
 
     def delete_docs_except(self, keep_ids: set[str]) -> None:
         with self._lock, self.conn.cursor() as cur, self.conn.transaction():
@@ -208,6 +233,14 @@ class PostgresStore:
             cur.execute("SELECT 1 FROM policies WHERE id = %s", (policy_id,))
             return cur.fetchone() is not None
 
+    def delete_policy(self, policy_id: str) -> bool:
+        with self._lock, self.conn.cursor() as cur, self.conn.transaction():
+            cur.execute("DELETE FROM policies WHERE id = %s", (policy_id,))
+            deleted = cur.rowcount > 0
+            if deleted:
+                cur.execute("DELETE FROM answer_cache")
+            return deleted
+
     def insert_policy(
         self,
         policy: PolicyDraft,
@@ -223,7 +256,7 @@ class PostgresStore:
             cur.execute(
                 """
                 INSERT INTO policies
-                  (id, title, audience, effective_from, effective_to, sample, body)
+                  (id, title, audience, effective_from, effective_to, body, source_name)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
@@ -232,8 +265,8 @@ class PostgresStore:
                     policy.audience,
                     policy.effective_from,
                     policy.effective_to,
-                    policy.sample,
                     policy.body,
+                    policy.source_name,
                 ),
             )
             for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
@@ -241,8 +274,9 @@ class PostgresStore:
                     """
                     INSERT INTO policy_chunks
                       (id, policy_id, section_label, heading, body, embed_text, embedding,
-                       audience, effective_from, effective_to)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       audience, effective_from, effective_to,
+                       heading_path, content_type, page, image_path, polarity)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         f"{policy.id}:{index}",
@@ -255,6 +289,11 @@ class PostgresStore:
                         policy.audience,
                         policy.effective_from,
                         policy.effective_to,
+                        chunk.heading_path,
+                        chunk.content_type,
+                        chunk.page,
+                        chunk.image_path,
+                        chunk.polarity,
                     ),
                 )
             cur.execute("DELETE FROM answer_cache")
@@ -263,7 +302,7 @@ class PostgresStore:
         with self._lock, self.conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, title, audience, effective_from, effective_to, sample, body
+                SELECT id, title, audience, effective_from, effective_to, body, source_name
                 FROM policies
                 ORDER BY title, effective_from
                 """
@@ -275,16 +314,11 @@ class PostgresStore:
                     audience=row[2],
                     effective_from=row[3],
                     effective_to=row[4],
-                    sample=row[5],
-                    body=row[6],
+                    body=row[5],
+                    source_name=row[6] or "",
                 )
                 for row in cur.fetchall()
             ]
-
-    def has_samples(self) -> bool:
-        with self._lock, self.conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM policies WHERE sample = TRUE LIMIT 1")
-            return cur.fetchone() is not None
 
     def policy_version(self) -> str:
         with self._lock, self.conn.cursor() as cur:
@@ -317,7 +351,8 @@ class PostgresStore:
                 """
                 SELECT c.id, c.policy_id, p.title, c.section_label, c.heading, c.body,
                        c.audience, c.effective_from, c.effective_to,
-                       1 - (c.embedding <=> %s) AS vec_score
+                       1 - (c.embedding <=> %s) AS vec_score,
+                       c.heading_path, c.content_type, c.page, c.image_path, c.polarity
                 FROM policy_chunks c
                 JOIN policies p ON p.id = c.policy_id
                 WHERE c.audience = ANY(%s)
@@ -334,7 +369,8 @@ class PostgresStore:
                     """
                     SELECT c.id, c.policy_id, p.title, c.section_label, c.heading, c.body,
                            c.audience, c.effective_from, c.effective_to,
-                           1 - (c.embedding <=> %s) AS vec_score
+                           1 - (c.embedding <=> %s) AS vec_score,
+                           c.heading_path, c.content_type, c.page, c.image_path, c.polarity
                     FROM policy_chunks c
                     JOIN policies p ON p.id = c.policy_id
                     WHERE c.audience = ANY(%s)
@@ -457,6 +493,11 @@ def _row_passage(row: tuple) -> Passage:
         effective_from=row[7],
         effective_to=effective_to,
         vec_score=float(row[9] or 0),
+        heading_path=row[10] or "",
+        content_type=row[11] or "section",
+        page=row[12],
+        image_path=row[13] or "",
+        polarity=row[14] or "",
     )
 
 
@@ -484,7 +525,9 @@ def _trace_payload(trace: TraceRecord) -> dict:
         "latency_ms": trace.latency_ms,
         "outcome": trace.outcome,
         "answer": trace.answer,
-        "citations": [{"label": item.label, "text": item.text} for item in trace.citations],
+        "citations": [
+            {"label": item.label, "text": item.text, "image": item.image} for item in trace.citations
+        ],
         "steps": trace.steps,
         "prompt_version": trace.prompt_version,
     }
@@ -516,7 +559,10 @@ def _trace_from_payload(payload: dict) -> TraceRecord:
         latency_ms=payload.get("latency_ms") or 0,
         outcome=payload.get("outcome") or "",
         answer=payload.get("answer") or "",
-        citations=[Citation(item["label"], item["text"]) for item in payload.get("citations") or []],
+        citations=[
+            Citation(item["label"], item["text"], item.get("image") or "")
+            for item in payload.get("citations") or []
+        ],
         steps=payload.get("steps") or [],
         prompt_version=payload.get("prompt_version") or "",
     )

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
+import shutil
 from datetime import date
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
-from .access import AUDIENCES
 from .config import BACKEND_ROOT
 from .models import ChunkDraft, PolicyDraft
 
@@ -16,136 +16,26 @@ POLICY_DIR = BACKEND_ROOT / "data" / "policies"
 CHUNK_CHARS = 3200
 CHUNK_OVERLAP = 400
 _OFFICE_SUFFIXES = (".pdf", ".docx")
-_MONTHS = {
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
-
-
-def parse_policy_text(raw: str, policy_id: str | None = None) -> PolicyDraft:
-    if not raw.startswith("---"):
-        raise ValueError("A policy file needs a title block at the top.")
-    parts = raw.split("---", 2)
-    if len(parts) < 3:
-        raise ValueError("A policy file needs a title block at the top.")
-    meta: dict[str, str] = {}
-    for line in parts[1].splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        meta[key.strip()] = value.strip()
-    title = meta.get("title", "").strip()
-    audience = meta.get("audience", "").strip()
-    if not title:
-        raise ValueError("Give this policy a name.")
-    if audience not in AUDIENCES:
-        raise ValueError("Choose who can see this policy.")
-    try:
-        effective_from = date.fromisoformat(meta["effective_from"])
-    except (KeyError, ValueError) as exc:
-        raise ValueError("Choose the date this policy starts.") from exc
-    effective_to_raw = meta.get("effective_to", "")
-    effective_to = date.fromisoformat(effective_to_raw) if effective_to_raw else None
-    body = parts[2].strip()
-    if not body:
-        raise ValueError("Add the policy text or choose a file.")
-    if not policy_id:
-        policy_id = "sample-" + hashlib.sha256(raw.encode()).hexdigest()[:16]
-    sample = meta.get("sample", "true").lower() != "false"
-    return PolicyDraft(
-        id=policy_id,
-        title=title,
-        audience=audience,
-        effective_from=effective_from,
-        effective_to=effective_to,
-        sample=sample,
-        body=body,
-    )
 
 
 def load_office_policies() -> list[PolicyDraft]:
     """Real PDF and Word files placed in the policies folder by HR."""
-    policies, _skipped = read_office_policies()
-    return policies
+    from .passages import office_policy
 
-
-def read_office_policies() -> tuple[list[PolicyDraft], list[str]]:
-    """Return readable policies and the file names that had no text layer."""
+    if not POLICY_DIR.exists():
+        return []
     policies = []
-    skipped: list[str] = []
     paths = [
         path
         for path in sorted(POLICY_DIR.iterdir(), key=lambda item: item.name.lower())
         if path.is_file() and path.suffix.lower() in _OFFICE_SUFFIXES
     ]
     for path in paths:
-        payload = path.read_bytes()
-        body = read_upload(path.name, payload)
-        if not body or not _text_layer_usable(path, body):
-            skipped.append(path.name)
+        policy = office_policy(path)
+        if policy is None or not policy.chunks:
             continue
-        policies.append(
-            PolicyDraft(
-                id="doc-" + hashlib.sha256(path.name.encode("utf-8") + b"\0" + payload).hexdigest()[:16],
-                title=_office_title(path),
-                audience="everyone",
-                effective_from=_office_date(path),
-                effective_to=None,
-                sample=False,
-                body=body,
-            )
-        )
-    return policies, skipped
-
-
-def _text_layer_usable(path: Path, body: str) -> bool:
-    """An Urdu scan can expose only a short English header. That is not the policy."""
-    name_is_urdu = any("\u0600" <= ch <= "\u06ff" for ch in path.name)
-    if not name_is_urdu:
-        return True
-    return any(
-        "\u0600" <= ch <= "\u06ff"
-        or "\u0750" <= ch <= "\u077f"
-        or "\ufb50" <= ch <= "\ufdff"
-        or "\ufe70" <= ch <= "\ufeff"
-        for ch in body
-    )
-
-
-def _office_title(path: Path) -> str:
-    stem = re.sub(r"^\d+\.\s*", "", path.stem)
-    stem = stem.replace("_", " ")
-    stem = re.sub(r"\s+", " ", stem).strip()
-    stem = re.sub(r"\s+\d{6}$", "", stem)
-    stem = re.sub(r"\s+[A-Za-z]{3,9}-\d{4}$", "", stem)
-    stem = re.sub(r"\s+FINAL$", "", stem, flags=re.IGNORECASE)
-    stem = re.sub(r"\s+-\s+Stylo$", "", stem, flags=re.IGNORECASE)
-    return stem.strip(" -–") or path.stem
-
-
-def _office_date(path: Path) -> date:
-    name = path.stem
-    numbered = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)", name)
-    if numbered:
-        day, month, year = (int(numbered.group(1)), int(numbered.group(2)), 2000 + int(numbered.group(3)))
-        try:
-            return date(year, month, day)
-        except ValueError:
-            pass
-    named = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*-(\d{4})", name, re.IGNORECASE)
-    if named:
-        return date(int(named.group(2)), _MONTHS[named.group(1)[:3].lower()], 1)
-    return date(2025, 1, 1)
+        policies.append(policy)
+    return policies
 
 
 def _sections(body: str) -> list[tuple[str, str]]:
@@ -210,10 +100,13 @@ def make_chunks(policy: PolicyDraft) -> list[ChunkDraft]:
 def read_upload(filename: str, payload: bytes) -> str:
     name = (filename or "").lower()
     if name.endswith(".pdf"):
-        from pypdf import PdfReader
+        import pymupdf
 
-        reader = PdfReader(BytesIO(payload))
-        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+        document = pymupdf.open(stream=payload, filetype="pdf")
+        try:
+            return "\n".join(page.get_text("text") or "" for page in document).strip()
+        finally:
+            document.close()
     if name.endswith(".docx"):
         return _docx_text(payload)
     return payload.decode("utf-8", errors="replace").strip()
@@ -230,3 +123,142 @@ def _docx_text(payload: bytes) -> str:
             if cells:
                 parts.append(" | ".join(cells))
     return "\n".join(parts).strip()
+
+
+def folder_filenames() -> dict[str, str]:
+    """Map each folder policy id to the file name currently on disk."""
+    if not POLICY_DIR.exists():
+        return {}
+    from .passages import file_policy_id
+
+    found: dict[str, str] = {}
+    for path in POLICY_DIR.iterdir():
+        if not path.is_file() or path.suffix.lower() not in _OFFICE_SUFFIXES:
+            continue
+        found[file_policy_id(path.name, path.read_bytes())] = path.name
+    return found
+
+
+def find_policy_file(policy_id: str) -> Path | None:
+    """The folder file whose hash is this id, if the policy was read from disk."""
+    if not policy_id.startswith("doc-") or not POLICY_DIR.exists():
+        return None
+    from .passages import file_policy_id
+
+    for path in POLICY_DIR.iterdir():
+        if not path.is_file() or path.suffix.lower() not in _OFFICE_SUFFIXES:
+            continue
+        if file_policy_id(path.name, path.read_bytes()) == policy_id:
+            return path
+    return None
+
+
+def remove_policy_files(
+    policy_id: str,
+    keep_file: Path | None = None,
+    keep_media: bool = False,
+) -> None:
+    """Drop the source file and saved pictures so a restart cannot bring the policy back."""
+    source = find_policy_file(policy_id)
+    if source is not None and _inside(source, POLICY_DIR):
+        if keep_file is None or source.resolve() != keep_file.resolve():
+            source.unlink()
+    if keep_media:
+        return
+    media = BACKEND_ROOT / "data" / "policy_media" / policy_id
+    if media.exists() and _inside(media, BACKEND_ROOT / "data" / "policy_media"):
+        shutil.rmtree(media)
+
+
+def replacement_policy(
+    title: str,
+    audience: str,
+    effective_from: date,
+    text: str,
+    filename: str,
+    payload: bytes,
+    previous: Path | None,
+) -> tuple[PolicyDraft, Path | None]:
+    """Build the policy that replaces an old one. PDF and Word keep the full reader."""
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if payload and suffix in _OFFICE_SUFFIXES:
+        from .passages import policy_from_bytes
+
+        stored_name = _destination_name(filename, previous)
+        try:
+            policy = policy_from_bytes(stored_name, payload)
+        except Exception as exc:
+            raise ValueError("unreadable") from exc
+        if policy is None or not policy.chunks:
+            raise ValueError("unreadable")
+        _retitle(policy, title, audience, effective_from)
+        policy.source_name = stored_name
+        return policy, POLICY_DIR / stored_name
+    body = text.strip()
+    if payload and filename:
+        body = read_upload(filename, payload).strip()
+    if not body:
+        raise ValueError("empty")
+    policy = PolicyDraft(
+        id="upload-" + uuid4().hex[:16],
+        title=title,
+        audience=audience,
+        effective_from=effective_from,
+        effective_to=None,
+        body=body,
+        source_name=Path(filename).name if filename else "",
+    )
+    policy.chunks = make_chunks(policy)
+    return policy, None
+
+
+def write_policy_file(path: Path, payload: bytes) -> None:
+    if not _inside(path, POLICY_DIR):
+        raise ValueError("outside")
+    POLICY_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def _retitle(policy: PolicyDraft, title: str, audience: str, effective_from: date) -> None:
+    old = policy.title
+    policy.title = title
+    policy.audience = audience
+    policy.effective_from = effective_from
+    policy.effective_to = None
+    for chunk in policy.chunks or []:
+        if old and (chunk.section_label == old or chunk.section_label.startswith(old + ", ")):
+            chunk.section_label = title + chunk.section_label[len(old) :]
+        lines = chunk.embed_text.split("\n")
+        if lines and lines[0] == old:
+            lines[0] = title
+            chunk.embed_text = "\n".join(lines)
+
+
+def _destination_name(filename: str, previous: Path | None) -> str:
+    safe = _safe_filename(filename)
+    if previous is not None and previous.name == safe:
+        return safe
+    if not (POLICY_DIR / safe).exists():
+        return safe
+    stem = Path(safe).stem
+    suffix = Path(safe).suffix
+    return f"{stem}-{uuid4().hex[:8]}{suffix}"
+
+
+def _safe_filename(name: str) -> str:
+    base = Path(name or "").name
+    suffix = Path(base).suffix.lower()
+    if suffix not in {".pdf", ".docx"}:
+        suffix = ".pdf"
+    stem = re.sub(r"[^A-Za-z0-9._ ()-]+", "", Path(base).stem).strip().strip(".")
+    if not stem:
+        stem = "policy"
+    return f"{stem[:80]}{suffix}"
+
+
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True

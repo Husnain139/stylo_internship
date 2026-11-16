@@ -3,15 +3,54 @@ from datetime import date
 from fastapi.testclient import TestClient
 
 from app.access import allowed_audiences
-from app.factory import memory_pipeline
 from app.guardrails import check_question
-from app.llm import DirtyLLM
 from app.main import create_app
-from app.models import Passage
+from app.models import Passage, PolicyDraft
+from app.pipeline import Pipeline
 from app.prompting import user_message
 from app.router import choose_model
 from app.sanitize import sanitize
+from app.store_memory import MemoryStore
 from evals.run import run_deterministic
+
+
+def _client():
+    store = MemoryStore()
+    store.add_employee("ali.employee@stylo.example", "Ali", "employee", False)
+    store.add_employee("insrah.hr@stylo.example", "Insrah", "hr", True)
+    store.add_employee("sara.intern@stylo.example", "Sara", "intern", False)
+    return TestClient(create_app(Pipeline(store, None, None)))
+
+
+def test_signup_keeps_the_stored_role():
+    client = _client()
+    missing = client.post("/api/sign-up", json={"email": "nobody@stylo.example", "password": "password1"})
+    assert missing.status_code == 400
+    assert "employee list" in missing.json()["message"]
+    created = client.post(
+        "/api/sign-up",
+        json={"email": "ali.employee@stylo.example", "password": "password1"},
+    )
+    assert created.status_code == 200
+    assert created.json()["me"]["isAdmin"] is False
+    assert created.json()["me"]["designation"] == "employee"
+    again = client.post(
+        "/api/sign-up",
+        json={"email": "ali.employee@stylo.example", "password": "anotherpass"},
+    )
+    assert again.status_code == 400
+    wrong = client.post("/api/session", json={"email": "ali.employee@stylo.example", "password": "nope-nope"})
+    assert wrong.status_code == 400
+    signed = client.post("/api/session", json={"email": "insrah.hr@stylo.example", "password": "password1"})
+    assert signed.status_code == 400
+    admin = client.post("/api/sign-up", json={"email": "insrah.hr@stylo.example", "password": "password1"})
+    assert admin.json()["me"]["isAdmin"] is True
+    client.cookies.clear()
+    blocked = client.get("/api/policies")
+    assert blocked.status_code == 401
+    client.post("/api/session", json={"email": "ali.employee@stylo.example", "password": "password1"})
+    forbidden = client.get("/api/policies")
+    assert forbidden.status_code == 403
 
 
 def test_ship_checks_pass():
@@ -56,8 +95,8 @@ def test_router_picks_the_smaller_model_for_a_direct_question():
 
 def test_prompt_has_no_internal_ids():
     passage = Passage(
-        id="sample-secret",
-        policy_id="sample-secret",
+        id="hidden-id",
+        policy_id="hidden-id",
         title="Leave policy",
         section_label="Leave policy, Annual leave",
         heading="Annual leave",
@@ -67,7 +106,7 @@ def test_prompt_has_no_internal_ids():
         effective_to=None,
     )
     text = user_message("How many annual leave days do I get?", "", [passage])
-    assert "sample-secret" not in text
+    assert "hidden-id" not in text
     assert "chunk_" not in text
     assert "Leave policy, Annual leave" in text
 
@@ -81,38 +120,67 @@ def test_sanitize_keeps_a_link_that_is_in_the_policy():
     assert "evil.example" not in cleaned
 
 
-def test_sign_in_leave_and_hidden_pay():
-    pipeline = memory_pipeline()
-    client = TestClient(create_app(pipeline))
-    signed = client.post("/api/session", json={"email": "sara.intern@stylo.example"})
+class _Vectors:
+    def embed(self, texts):
+        return [[0.0, 1.0] for _ in texts]
+
+
+def test_admin_can_delete_or_replace_a_policy(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.ingest.POLICY_DIR", tmp_path)
+    source = tmp_path / "note.docx"
+    payload = b"folder-policy"
+    source.write_bytes(payload)
+    from app.passages import file_policy_id
+
+    policy_id = file_policy_id("note.docx", payload)
+    store = MemoryStore()
+    store.add_employee("ali.employee@stylo.example", "Ali", "employee", False)
+    store.add_employee("insrah.hr@stylo.example", "Insrah", "hr", True)
+    store.policies[policy_id] = PolicyDraft(
+        id=policy_id,
+        title="Folder policy",
+        audience="everyone",
+        effective_from=date(2026, 1, 1),
+        effective_to=None,
+        body="Old folder text",
+    )
+    client = TestClient(create_app(Pipeline(store, _Vectors(), None)))
+    client.post("/api/sign-up", json={"email": "ali.employee@stylo.example", "password": "password1"})
+    denied = client.delete(f"/api/policies/{policy_id}")
+    assert denied.status_code == 403
+    client.cookies.clear()
+    client.post("/api/sign-up", json={"email": "insrah.hr@stylo.example", "password": "password1"})
+    current = client.get("/api/policies").json()["policies"]
+    assert current[0]["filename"] == "note.docx"
+    replaced = client.post(
+        f"/api/policies/{policy_id}",
+        data={"title": "New policy", "audience": "hr", "starts_on": "2026-02-01", "text": "The new rule is 12 days."},
+    )
+    assert replaced.status_code == 200
+    assert not source.exists()
+    listed = client.get("/api/policies").json()["policies"]
+    assert [row["title"] for row in listed] == ["New policy"]
+    assert listed[0]["audience"] == "hr"
+    assert listed[0]["filename"] == ""
+    assert listed[0]["id"] != policy_id
+    removed = client.delete(f"/api/policies/{listed[0]['id']}")
+    assert removed.status_code == 200
+    assert client.get("/api/policies").json()["policies"] == []
+    missing = client.delete(f"/api/policies/{listed[0]['id']}")
+    assert missing.status_code == 404
+
+
+def test_sign_in_refuses_pay_and_hides_admin_pages():
+    client = _client()
+    signed = client.post(
+        "/api/sign-up",
+        json={"email": "sara.intern@stylo.example", "password": "password1"},
+    )
     assert signed.status_code == 200
-    leave = client.post("/api/ask", json={"question": "How many annual leave days do I get?"})
-    assert leave.status_code == 200
-    assert "18" in leave.json()["answer"]
-    assert leave.json()["citations"][0]["label"].startswith("Leave policy")
-    hidden = client.post("/api/ask", json={"question": "What are the salary bands?"})
-    assert hidden.json()["outcome"] == "refused"
-    assert "80000" not in hidden.json()["answer"]
-    assert hidden.json()["citations"] == []
+    pay = client.post("/api/ask", json={"question": "What is the CEO's salary?"})
+    assert pay.status_code == 200
+    assert pay.json()["outcome"] == "refused"
+    assert pay.json()["citations"] == []
     policies = client.get("/api/policies")
     assert policies.status_code == 403
-    assert policies.json()["message"] == "This page is for HR."
-
-
-def test_sick_days_use_the_sick_leave_section():
-    pipeline = memory_pipeline()
-    person = pipeline.store.employee("ali.employee@stylo.example")
-    result = pipeline.ask(person, "How many sick days do I get?")
-    assert result.outcome == "answered"
-    assert "10" in result.answer
-    assert any("Sick leave" in item.label for item in result.citations)
-
-
-def test_dirty_model_cannot_leak_a_chunk_tag():
-    pipeline = memory_pipeline(llm=DirtyLLM())
-    person = pipeline.store.employee("ali.employee@stylo.example")
-    result = pipeline.ask(person, "How many annual leave days do I get?")
-    assert "chunk_" not in result.answer
-    assert "evil.example" not in result.answer
-    assert "999999" not in result.answer
-    assert "18" in result.answer
+    assert policies.json()["message"] == "This page is for an admin."

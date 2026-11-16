@@ -69,11 +69,40 @@ def token_set(text: str) -> set[str]:
 
 
 def keyword_score(query: str, passage: str) -> float:
-    wanted = token_set(query)
+    wanted = token_list(query)
     if not wanted:
         return 0.0
     found = token_set(passage)
-    return len(wanted & found) / len(wanted)
+    found_by_length: dict[int, list[str]] = {}
+    for token in found:
+        found_by_length.setdefault(len(token), []).append(token)
+    hits = 0
+    for token in set(wanted):
+        if token in found or _near_token(token, found_by_length):
+            hits += 1
+    return hits / len(set(wanted))
+
+
+def _near_token(token: str, found_by_length: dict[int, list[str]]) -> bool:
+    """A one-letter slip such as summart or retial still matches the policy word."""
+    if len(token) < 5:
+        return False
+    nearby: list[str] = []
+    for length in (len(token) - 1, len(token), len(token) + 1):
+        nearby.extend(found_by_length.get(length, []))
+    return any(_edit_distance(token, other) <= 1 for other in nearby)
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if abs(len(left) - len(right)) > 1:
+        return 2
+    previous = list(range(len(right) + 1))
+    for i, char in enumerate(left, start=1):
+        current = [i]
+        for j, other in enumerate(right, start=1):
+            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (char != other)))
+        previous = current
+    return previous[-1]
 
 
 def normalize_for_rules(text: str) -> str:

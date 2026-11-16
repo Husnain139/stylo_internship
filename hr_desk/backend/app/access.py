@@ -23,14 +23,6 @@ AUDIENCE_LABELS = {
     "executive": "Executives",
 }
 
-PEOPLE = (
-    ("sara.intern@stylo.example", "Sara", "intern"),
-    ("ali.employee@stylo.example", "Ali", "employee"),
-    ("noor.manager@stylo.example", "Noor", "manager"),
-    ("insrah.hr@stylo.example", "Insrah", "hr"),
-    ("omar.executive@stylo.example", "Omar", "executive"),
-)
-
 
 def allowed_audiences(designation: str) -> tuple[str, ...]:
     if designation == "hr":

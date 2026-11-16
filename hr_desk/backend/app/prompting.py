@@ -22,7 +22,12 @@ def system_prompt(today: date) -> str:
     return raw.replace("{{today}}", today.isoformat())
 
 
-def user_message(question: str, background: str, passages: list[Passage]) -> str:
+def user_message(
+    question: str,
+    background: str,
+    passages: list[Passage],
+    designation: str = "",
+) -> str:
     blocks = []
     for passage in passages:
         end = ""
@@ -38,7 +43,10 @@ def user_message(question: str, background: str, passages: list[Passage]) -> str
             )
         )
     background_line = background.strip() or "None"
+    role = designation.strip()
+    role_line = f"Employee designation: {role}\n\n" if role else ""
     return (
+        f"{role_line}"
         f"Background: {background_line}\n\n"
         "Passages:\n\n"
         + "\n\n".join(blocks)

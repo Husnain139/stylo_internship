@@ -1,7 +1,7 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useId, useState } from "react";
-import { PersonChoices } from "@/components/shell";
 import { useSession } from "@/components/session";
 import { api, type AskResponse, type Citation } from "@/lib/api";
 
@@ -19,7 +19,7 @@ type Turn = {
 };
 
 export function AskScreen() {
-  const { me, people, samples, loadError, retry, signIn } = useSession();
+  const { me, loadError, retry } = useSession();
   const questionId = useId();
   const helpId = useId();
   const errorId = useId();
@@ -27,7 +27,6 @@ export function AskScreen() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [signingIn, setSigningIn] = useState(false);
 
   useEffect(() => {
     setTurns([]);
@@ -35,21 +34,13 @@ export function AskScreen() {
     setError("");
   }, [me?.email]);
 
-  async function choose(email: string) {
-    setError("");
-    setSigningIn(true);
-    try {
-      await signIn(email);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Choose a name from the list.");
-    } finally {
-      setSigningIn(false);
-    }
-  }
-
   async function submit(text: string) {
     const trimmed = text.trim();
     if (busy) return;
+    if (!trimmed) {
+      setError("Type your question first.");
+      return;
+    }
     setQuestion(trimmed);
     setError("");
     setBusy(true);
@@ -78,10 +69,19 @@ export function AskScreen() {
 
   if (!me) {
     return (
-      <section className="stack">
-        <h1>Who are you?</h1>
-        <p>Practice sign-in. Company sign-in will replace this.</p>
-        <PersonChoices people={people} busy={signingIn} onChoose={choose} />
+      <section className="stack auth">
+        <header className="page-head">
+          <h1>Ask about a policy</h1>
+          <p className="lead">Sign in with the work email on your employee record. Then ask in your own words.</p>
+        </header>
+        <div className="actions">
+          <Link className="primary" href="/sign-in">
+            Sign in
+          </Link>
+          <Link className="secondary" href="/sign-up">
+            Create a password
+          </Link>
+        </div>
         {loadError ? (
           <p className="form-error" role="alert">
             {loadError}{" "}
@@ -90,21 +90,16 @@ export function AskScreen() {
             </button>
           </p>
         ) : null}
-        {error ? (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
-        ) : null}
       </section>
     );
   }
 
   return (
     <section className="stack">
-      <h1>Ask about a policy</h1>
-      {samples ? (
-        <p className="banner">These are sample policies until HR replaces them.</p>
-      ) : null}
+      <header className="page-head">
+        <h1>Ask about a policy</h1>
+        <p className="lead">Ask one question in your own words. The answer comes from Stylo policies.</p>
+      </header>
       {turns.length > 0 ? (
         <ol className="thread">
           {turns.map((turn, index) => (
@@ -129,40 +124,39 @@ export function AskScreen() {
           void submit(question);
         }}
       >
-        <label htmlFor={questionId}>Your question</label>
-        <textarea
-          id={questionId}
-          name="question"
-          value={question}
-          rows={3}
-          aria-describedby={error ? `${helpId} ${errorId}` : helpId}
-          aria-invalid={error ? true : undefined}
-          onChange={(event) => setQuestion(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void submit(question);
-            }
-          }}
-        />
-        <p id={helpId} className="help">
-          Ask one question about a Stylo policy. Press Enter to ask.
-        </p>
+        <div className="field">
+          <label htmlFor={questionId}>Your question</label>
+          <textarea
+            id={questionId}
+            name="question"
+            value={question}
+            rows={3}
+            aria-describedby={error ? `${helpId} ${errorId}` : helpId}
+            aria-invalid={error ? true : undefined}
+            onChange={(event) => setQuestion(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void submit(question);
+              }
+            }}
+          />
+          <p id={helpId} className="help">
+            One question at a time. Press Enter to ask.
+          </p>
+        </div>
         {error ? (
           <p id={errorId} className="form-error" role="alert">
             {error}
           </p>
         ) : null}
-        {busy ? (
-          <p role="status">Looking through the policies…</p>
-        ) : null}
-        <button className="primary" type="submit">
-          Ask
+        <button className="primary" type="submit" disabled={busy}>
+          {busy ? "Looking through the policies…" : "Ask"}
         </button>
       </form>
       {turns.length === 0 ? (
         <div className="suggestions">
-          <p className="whisper">Or start with one of these</p>
+          <p className="whisper">Not sure where to start? Try one of these.</p>
           <ul className="people">
             {SUGGESTIONS.map((item) => (
               <li key={item}>
@@ -184,6 +178,7 @@ function Answer({ text, citations, live }: { text: string; citations: Citation[]
   return (
     <div>
       <p className="answer" aria-live={live ? "polite" : undefined}>
+        <span className="whisper">Answer</span>
         {text}
       </p>
       {citations.length > 0 ? (
@@ -200,7 +195,15 @@ function Answer({ text, citations, live }: { text: string; citations: Citation[]
           {open ? (
             <div id={panelId}>
               {citations.map((item) => (
-                <p key={item.label}>{item.text}</p>
+                <div key={`${item.label}-${item.image || "text"}`}>
+                  <p>{item.text}</p>
+                  {item.image
+                    ? item.image.split("|").map((src) => (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img key={src} src={src} alt="" />
+                      ))
+                    : null}
+                </div>
               ))}
             </div>
           ) : null}

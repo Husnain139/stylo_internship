@@ -11,26 +11,34 @@ export function ChecksScreen() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (me?.designation !== "hr") return;
+    if (!me?.isAdmin) return;
     api<ChecksResponse>("/api/checks")
       .then(setReport)
       .catch((caught) => setError(caught instanceof Error ? caught.message : "Something went wrong. Try again."));
-  }, [me?.designation]);
+  }, [me?.isAdmin]);
 
   if (!me) {
     return (
       <section className="stack">
-        <h1>Checks</h1>
-        <p>Choose who you are to continue.</p>
-        <Link href="/">Go to sign-in</Link>
+        <header className="page-head">
+          <h1>Checks</h1>
+          <p className="lead">Sign in to continue.</p>
+        </header>
+        <div className="actions">
+          <Link className="primary" href="/sign-in">
+            Sign in
+          </Link>
+        </div>
       </section>
     );
   }
-  if (me.designation !== "hr") {
+  if (!me.isAdmin) {
     return (
       <section className="stack">
-        <h1>Checks</h1>
-        <p>This page is for HR.</p>
+        <header className="page-head">
+          <h1>Checks</h1>
+          <p className="lead">Only an admin can open this page.</p>
+        </header>
         <Link href="/">Back to Ask about a policy</Link>
       </section>
     );
@@ -42,7 +50,10 @@ export function ChecksScreen() {
 
   return (
     <section className="stack">
-      <h1>Checks</h1>
+      <header className="page-head">
+        <h1>Checks</h1>
+        <p className="lead">These checks show whether answers stay inside company policy.</p>
+      </header>
       {error ? (
         <p className="form-error" role="alert">
           {error}
@@ -52,13 +63,13 @@ export function ChecksScreen() {
       {report ? (
         <>
           <p className={report.status === "safe" ? "success" : "banner"}>{report.summary}</p>
-          {report.ran_at ? <p className="whisper">Last run {formatWhen(report.ran_at)}.</p> : null}
+          {report.ran_at ? <p className="whisper">Last checked {formatWhen(report.ran_at)}.</p> : null}
           {primary.length > 0 ? (
             <ul className="plain-list">
               {primary.map((check) => (
                 <li key={check.name}>
                   <strong>{check.name}</strong>
-                  <span>{check.ok ? "Passed" : "Failed"}</span>
+                  <span className={check.ok ? "badge ok" : "badge bad"}>{check.ok ? "Passed" : "Did not pass"}</span>
                 </li>
               ))}
             </ul>
@@ -70,7 +81,7 @@ export function ChecksScreen() {
                 {rest.map((check) => (
                   <li key={check.name}>
                     <strong>{check.name}</strong>
-                    <span>{check.ok ? "Passed" : "Failed"}</span>
+                    <span className={check.ok ? "badge ok" : "badge bad"}>{check.ok ? "Passed" : "Did not pass"}</span>
                   </li>
                 ))}
               </ul>

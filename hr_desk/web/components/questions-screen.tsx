@@ -11,26 +11,34 @@ export function QuestionsScreen() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (me?.designation !== "hr") return;
+    if (!me?.isAdmin) return;
     api<{ questions: QuestionRow[] }>("/api/questions")
       .then((data) => setRows(data.questions))
       .catch((caught) => setError(caught instanceof Error ? caught.message : "Something went wrong. Try again."));
-  }, [me?.designation]);
+  }, [me?.isAdmin]);
 
   if (!me) {
     return (
       <section className="stack">
-        <h1>Questions people asked</h1>
-        <p>Choose who you are to continue.</p>
-        <Link href="/">Go to sign-in</Link>
+        <header className="page-head">
+          <h1>Questions people asked</h1>
+          <p className="lead">Sign in to continue.</p>
+        </header>
+        <div className="actions">
+          <Link className="primary" href="/sign-in">
+            Sign in
+          </Link>
+        </div>
       </section>
     );
   }
-  if (me.designation !== "hr") {
+  if (!me.isAdmin) {
     return (
       <section className="stack">
-        <h1>Questions people asked</h1>
-        <p>This page is for HR.</p>
+        <header className="page-head">
+          <h1>Questions people asked</h1>
+          <p className="lead">Only an admin can open this page.</p>
+        </header>
         <Link href="/">Back to Ask about a policy</Link>
       </section>
     );
@@ -38,7 +46,10 @@ export function QuestionsScreen() {
 
   return (
     <section className="stack">
-      <h1>Questions people asked</h1>
+      <header className="page-head">
+        <h1>Questions people asked</h1>
+        <p className="lead">Questions employees have asked, and what HR Desk answered.</p>
+      </header>
       {error ? (
         <p className="form-error" role="alert">
           {error}
@@ -65,8 +76,8 @@ function QuestionItem({ row }: { row: QuestionRow }) {
       <p>
         <strong>{row.question || "Empty question"}</strong>
       </p>
-      <p>
-        {row.outcome_label}. {row.policy}. {row.asked_by}. {formatWhen(row.when)}.
+      <p className="meta">
+        {row.outcome_label} · {row.policy} · {row.asked_by} · {formatWhen(row.when)}
       </p>
       <button type="button" aria-expanded={open} aria-controls={panelId} onClick={() => setOpen((value) => !value)}>
         {open ? "Hide details" : "Show details"}

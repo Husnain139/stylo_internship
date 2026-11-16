@@ -6,11 +6,11 @@ import { api, type Person } from "@/lib/api";
 type SessionValue = {
   loading: boolean;
   me: Person | null;
-  people: Person[];
-  samples: boolean;
   loadError: string;
   retry: () => Promise<void>;
-  signIn: (email: string) => Promise<void>;
+  signIn: (email: string, password: string) => Promise<void>;
+  signUp: (email: string, password: string) => Promise<void>;
+  signOut: () => Promise<void>;
 };
 
 const SessionContext = createContext<SessionValue | null>(null);
@@ -18,14 +18,10 @@ const SessionContext = createContext<SessionValue | null>(null);
 export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [me, setMe] = useState<Person | null>(null);
-  const [people, setPeople] = useState<Person[]>([]);
-  const [samples, setSamples] = useState(true);
   const [loadError, setLoadError] = useState("");
 
   async function refresh() {
-    const data = await api<{ samples: boolean; people: Person[]; me: Person | null }>("/api/bootstrap");
-    setSamples(data.samples);
-    setPeople(data.people);
+    const data = await api<{ me: Person | null }>("/api/bootstrap");
     setMe(data.me);
     setLoadError("");
   }
@@ -34,24 +30,34 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     refresh()
       .catch((caught) => {
         setMe(null);
-        setPeople([]);
-        setLoadError(
-          caught instanceof Error ? caught.message : "The sign-in list didn't load. Try again.",
-        );
+        setLoadError(caught instanceof Error ? caught.message : "The page didn't load. Try again.");
       })
       .finally(() => setLoading(false));
   }, []);
 
-  async function signIn(email: string) {
+  async function signIn(email: string, password: string) {
     const data = await api<{ me: Person }>("/api/session", {
       method: "POST",
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, password }),
     });
     setMe(data.me);
   }
 
+  async function signUp(email: string, password: string) {
+    const data = await api<{ me: Person }>("/api/sign-up", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    setMe(data.me);
+  }
+
+  async function signOut() {
+    await api("/api/sign-out", { method: "POST" });
+    setMe(null);
+  }
+
   return (
-    <SessionContext.Provider value={{ loading, me, people, samples, loadError, retry: refresh, signIn }}>
+    <SessionContext.Provider value={{ loading, me, loadError, retry: refresh, signIn, signUp, signOut }}>
       {children}
     </SessionContext.Provider>
   );

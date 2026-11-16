@@ -12,11 +12,13 @@ export type Person = {
   name: string;
   designation: string;
   role: string;
+  isAdmin: boolean;
 };
 
 export type Citation = {
   label: string;
   text: string;
+  image?: string;
 };
 
 export type AskResponse = {
@@ -26,12 +28,13 @@ export type AskResponse = {
 };
 
 export type PolicyRow = {
+  id: string;
   title: string;
   audience: string;
   who: string;
   starts_on: string;
   ends_on?: string | null;
-  sample: boolean;
+  filename?: string;
 };
 
 export type QuestionRow = {

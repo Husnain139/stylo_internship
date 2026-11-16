@@ -4,7 +4,7 @@ import { Shell } from "@/components/shell";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Policy help — Stylo",
+  title: "HR Desk",
   description: "Ask a question about Stylo policies and see the answer in plain language.",
 };
 

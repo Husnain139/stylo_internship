@@ -1,4 +1,4 @@
-"""Wire the store, embeddings, and model for the app and the checks."""
+"""Wire the store, embeddings, and model."""
 
 from __future__ import annotations
 
@@ -7,87 +7,63 @@ import os
 from dotenv import load_dotenv
 
 from .config import DESK_ROOT, openai_api_key
-from .embeddings import FakeEmbedder
-from .llm import OpenAIBackend, StubLLM
+from .llm import OpenAIBackend
 from .pipeline import Pipeline
-from .store_memory import MemoryStore
 
 load_dotenv(DESK_ROOT / ".env")
-
-
-def sync_samples(store, embedder) -> None:
-    from .ingest import load_sample_policies
-
-    _sync(store, embedder, load_sample_policies(), replace_samples=False)
 
 
 def sync_library(store, embedder) -> None:
     from .ingest import load_office_policies
 
     office = load_office_policies()
-    if office:
-        _sync(store, embedder, office, replace_samples=True)
+    if not office:
         return
-    sync_samples(store, embedder)
+    _sync(store, embedder, office)
 
 
-def _sync(store, embedder, policies, *, replace_samples: bool) -> None:
+def _sync(store, embedder, policies) -> None:
     from .ingest import make_chunks as chunk_policy
 
-    if replace_samples:
-        store.delete_samples_except(set())
-        store.delete_docs_except({policy.id for policy in policies})
-    else:
-        store.delete_samples_except({policy.id for policy in policies if policy.sample})
+    store.delete_docs_except({policy.id for policy in policies})
     for policy in policies:
         if store.has_policy(policy.id):
             continue
-        chunks = chunk_policy(policy)
+        chunks = policy.chunks if policy.chunks else chunk_policy(policy)
         vectors = embedder.embed([chunk.embed_text for chunk in chunks])
         store.insert_policy(policy, chunks, vectors)
 
 
 def open_store():
-    mode = os.environ.get("HR_DESK_STORE", "").strip().lower()
-    if mode == "memory":
-        return MemoryStore()
     dsn = os.environ.get("DATABASE_URL", "").strip()
-    if mode == "postgres" or (dsn and mode != "memory"):
-        if not dsn:
-            raise RuntimeError("DATABASE_URL is required when HR_DESK_STORE=postgres.")
-        from .store_pg import PostgresStore
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is required.")
+    from .store_pg import PostgresStore
 
-        return PostgresStore(dsn)
-    return MemoryStore()
+    return PostgresStore(dsn)
 
 
-def build_embedder(stub: bool = False):
-    if stub or not openai_api_key():
-        return FakeEmbedder()
+def build_embedder():
+    key = openai_api_key()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is required.")
     from openai import OpenAI
 
-    return OpenAIBackend(OpenAI(api_key=openai_api_key()))
+    return OpenAIBackend(OpenAI(api_key=key))
 
 
-def build_llm(stub: bool = False):
-    if stub or not openai_api_key():
-        return StubLLM()
+def build_llm():
+    key = openai_api_key()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is required.")
     from openai import OpenAI
 
-    return OpenAIBackend(OpenAI(api_key=openai_api_key()))
+    return OpenAIBackend(OpenAI(api_key=key))
 
 
-def build_pipeline(stub: bool = False) -> Pipeline:
+def build_pipeline() -> Pipeline:
     store = open_store()
-    embedder = build_embedder(stub=stub)
-    llm = build_llm(stub=stub)
+    embedder = build_embedder()
+    llm = build_llm()
     sync_library(store, embedder)
-    return Pipeline(store, embedder, llm)
-
-
-def memory_pipeline(llm=None, embedder=None) -> Pipeline:
-    store = MemoryStore()
-    embedder = embedder or FakeEmbedder()
-    llm = llm or StubLLM()
-    sync_samples(store, embedder)
     return Pipeline(store, embedder, llm)

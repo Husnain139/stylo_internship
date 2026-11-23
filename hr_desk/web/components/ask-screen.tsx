@@ -1,21 +1,35 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useSession } from "@/components/session";
-import { api, type AskResponse, type Citation } from "@/lib/api";
+import { api, type AskResponse } from "@/lib/api";
+import { formatAnswer } from "@/lib/format-answer";
 
-const SUGGESTIONS = [
-  "What does the medical takaful policy cover?",
-  "What is in the code of conduct?",
-  "What is the corrective action policy?",
-  "How does a provident fund loan work?",
-];
+const GENERAL_SUGGESTIONS = ["What is in the code of conduct?", "What is the corrective action policy?"];
+const ADDITIONAL_SUGGESTIONS: Record<string, string[]> = {
+  employee: ["What does the medical takaful policy cover?"],
+  manager: ["How do I request approval for business travel?"],
+  executive: ["How do I file a travel claim?"],
+  hr: ["How does a provident fund loan work?"],
+};
 
-type Turn = {
+type Chat = { id: string; title: string };
+
+type ConversationMessage = {
   role: "user" | "assistant";
   text: string;
-  citations: Citation[];
+};
+
+type Turn = ConversationMessage & {
+  id: number;
+};
+
+type ChatList = {
+  conversations: Chat[];
+  messageLimit: number;
+  retentionDays: number;
+  questionLimit: number;
 };
 
 export function AskScreen() {
@@ -25,45 +39,130 @@ export function AskScreen() {
   const errorId = useId();
   const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [chatId, setChatId] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [limits, setLimits] = useState<ChatList | null>(null);
+  const [hiddenMessages, setHiddenMessages] = useState(0);
+  const [historyError, setHistoryError] = useState("");
+  const [sending, setSending] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const request = useRef<AbortController | null>(null);
+  const nextTurnId = useRef(0);
 
   useEffect(() => {
+    request.current?.abort();
     setTurns([]);
+    setChatId("");
+    setHiddenMessages(0);
+    setLimits(null);
+    setChats([]);
     setQuestion("");
     setError("");
+    setHistoryError("");
+    if (!me) return;
+    let active = true;
+    api<ChatList>("/api/conversations")
+      .then((result) => {
+        if (!active) return;
+        setChats(result.conversations);
+        setLimits(result);
+      })
+      .catch(() => { if (active) setHistoryError("Could not load saved chats."); });
+    return () => { active = false; };
   }, [me?.email]);
+
+  async function openChat(id: string) {
+    if (busy) return;
+    setBusy(true);
+    setDeleting(false);
+    setError("");
+    try {
+      const result = id
+        ? await api<{ messages: ConversationMessage[]; hiddenMessages: number }>(`/api/conversations/${id}`)
+        : { messages: [], hiddenMessages: 0 };
+      setChatId(id);
+      setHiddenMessages(result.hiddenMessages);
+      setTurns(result.messages.map((item) => ({ ...item, id: ++nextTurnId.current })));
+      setQuestion("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not open that chat.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteChat() {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/conversations/${chatId}`, { method: "DELETE" });
+      setChats((items) => items.filter((item) => item.id !== chatId));
+      setChatId("");
+      setHiddenMessages(0);
+      setTurns([]);
+      setQuestion("");
+      setDeleting(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not delete that chat.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function stop() {
+    request.current?.abort();
+  }
 
   async function submit(text: string) {
     const trimmed = text.trim();
-    if (busy) return;
+    if (busy || request.current) return;
     if (!trimmed) {
       setError("Type your question first.");
       return;
     }
-    setQuestion(trimmed);
+    if (limits && trimmed.length > limits.questionLimit) {
+      setError(`Use ${limits.questionLimit} characters or fewer.`);
+      return;
+    }
+    const controller = new AbortController();
+    const userTurn: Turn = { id: ++nextTurnId.current, role: "user", text: trimmed };
+    request.current = controller;
     setError("");
     setBusy(true);
-    const history = turns.map((turn) => ({ role: turn.role, text: turn.text }));
+    setSending(true);
+    setQuestion("");
+    setTurns((current) => [...current, userTurn]);
     try {
+      let id = chatId;
+      if (!id) {
+        const chat = await api<{ id: string }>("/api/conversations", { method: "POST", signal: controller.signal });
+        if (controller.signal.aborted) return;
+        id = chat.id;
+        setChatId(id);
+        setChats((items) => [{ id, title: trimmed.slice(0, 70) }, ...items].slice(0, 20));
+      }
       const result = await api<AskResponse>("/api/ask", {
         method: "POST",
-        body: JSON.stringify({ question: trimmed, history }),
+        body: JSON.stringify({ question: trimmed, conversation_id: id }),
+        signal: controller.signal,
       });
-      setTurns((current) => [
-        ...current,
-        ...(trimmed ? [{ role: "user" as const, text: trimmed, citations: [] }] : []),
-        { role: "assistant" as const, text: result.answer, citations: result.citations },
-      ]);
-      setQuestion("");
+      if (controller.signal.aborted) return;
+      const answer: Turn = { id: ++nextTurnId.current, role: "assistant", text: result.answer };
+      setTurns((current) => [...current, answer].slice(-(limits?.messageLimit ?? 40)));
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "The assistant is not available right now. Try again in a moment.",
-      );
+      setTurns((current) => current.filter((turn) => turn.id !== userTurn.id));
+      setQuestion(trimmed);
+      if (!controller.signal.aborted) {
+        setError(caught instanceof Error ? caught.message : "The assistant is temporarily unavailable.");
+      }
     } finally {
-      setBusy(false);
+      if (request.current === controller) {
+        request.current = null;
+        setSending(false);
+        setBusy(false);
+      }
     }
   }
 
@@ -72,14 +171,14 @@ export function AskScreen() {
       <section className="stack auth">
         <header className="page-head">
           <h1>Ask about a policy</h1>
-          <p className="lead">Sign in with the work email on your employee record. Then ask in your own words.</p>
+          <p className="lead">Sign in to ask about Stylo policies.</p>
         </header>
         <div className="actions">
           <Link className="primary" href="/sign-in">
             Sign in
           </Link>
           <Link className="secondary" href="/sign-up">
-            Create a password
+            Set up your account
           </Link>
         </div>
         {loadError ? (
@@ -95,25 +194,61 @@ export function AskScreen() {
   }
 
   return (
-    <section className="stack">
+    <section className="stack employee-chat">
       <header className="page-head">
         <h1>Ask about a policy</h1>
-        <p className="lead">Ask one question in your own words. The answer comes from Stylo policies.</p>
       </header>
+      {historyError ? <p className="banner" role="status">{historyError}</p> : null}
+      {chats.length > 0 ? <div className="chat-toolbar">
+        <label htmlFor={`${questionId}-chats`}>Saved chats</label>
+        <select id={`${questionId}-chats`} value={chatId} disabled={busy}
+          onChange={(event) => void openChat(event.target.value)}>
+          <option value="">New chat</option>
+          {chats.map((chat) => <option key={chat.id} value={chat.id}>{chat.title}</option>)}
+        </select>
+        {chatId ? <button type="button" disabled={busy} onClick={() => void openChat("")}>New chat</button> : null}
+        {chatId && !deleting ? <button type="button" disabled={busy} onClick={() => setDeleting(true)}>Delete chat</button> : null}
+        {deleting ? (
+          <div className="row-actions confirm" role="group" aria-label="Confirm chat deletion">
+            <span>Delete this chat?</span>
+            <button className="danger" type="button" disabled={busy} onClick={() => void deleteChat()}>Delete</button>
+            <button type="button" disabled={busy} onClick={() => setDeleting(false)}>Cancel</button>
+          </div>
+        ) : null}
+      </div> : null}
+      {limits ? (
+        <details className="chat-details"><summary>Chat storage</summary>
+          <p>Up to {limits.messageLimit} messages per chat, kept for {limits.retentionDays} days after your last activity.</p>
+        </details>
+      ) : null}
+      {hiddenMessages > 0 ? (
+        <p className="banner" role="status">Earlier messages were hidden after a policy or access change.</p>
+      ) : null}
       {turns.length > 0 ? (
-        <ol className="thread">
+        <ol className="thread" aria-label="Conversation">
           {turns.map((turn, index) => (
-            <li key={`${turn.role}-${index}`} className={turn.role}>
+            <li key={turn.id} className={turn.role}>
               {turn.role === "user" ? (
                 <p>
                   <span className="whisper">You asked</span>
                   {turn.text}
                 </p>
               ) : (
-                <Answer text={turn.text} citations={turn.citations} live={index === turns.length - 1} />
+                <Answer
+                  text={turn.text}
+                  live={index === turns.length - 1}
+                />
               )}
             </li>
           ))}
+          {sending ? (
+            <li className="assistant">
+              <div className="answer">
+                <span className="whisper">Answer</span>
+                <p role="status">Checking policies…</p>
+              </div>
+            </li>
+          ) : null}
         </ol>
       ) : null}
       <form
@@ -131,34 +266,40 @@ export function AskScreen() {
             name="question"
             value={question}
             rows={3}
+            maxLength={limits?.questionLimit}
             aria-describedby={error ? `${helpId} ${errorId}` : helpId}
+            placeholder="Ask about leave, travel, or another policy"
             aria-invalid={error ? true : undefined}
             onChange={(event) => setQuestion(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && window.matchMedia("(pointer: fine)").matches) {
                 event.preventDefault();
                 void submit(question);
               }
             }}
           />
-          <p id={helpId} className="help">
-            One question at a time. Press Enter to ask.
-          </p>
+          <span id={helpId} className="sr-only">On a desktop keyboard, press Enter to ask or Shift+Enter for a new line.</span>
         </div>
         {error ? (
           <p id={errorId} className="form-error" role="alert">
             {error}
           </p>
         ) : null}
-        <button className="primary" type="submit" disabled={busy}>
-          {busy ? "Looking through the policies…" : "Ask"}
-        </button>
+        {sending ? (
+          <button className="stop" type="button" onClick={stop}>
+            Stop
+          </button>
+        ) : (
+          <button className="primary" type="submit" disabled={busy}>
+            Ask
+          </button>
+        )}
       </form>
       {turns.length === 0 ? (
         <div className="suggestions">
-          <p className="whisper">Not sure where to start? Try one of these.</p>
+          <h2>Try asking</h2>
           <ul className="people">
-            {SUGGESTIONS.map((item) => (
+            {[...GENERAL_SUGGESTIONS, ...(ADDITIONAL_SUGGESTIONS[me.designation] || [])].map((item) => (
               <li key={item}>
                 <button type="button" disabled={busy} onClick={() => void submit(item)}>
                   {item}
@@ -172,43 +313,85 @@ export function AskScreen() {
   );
 }
 
-function Answer({ text, citations, live }: { text: string; citations: Citation[]; live: boolean }) {
-  const [open, setOpen] = useState(false);
-  const panelId = useId();
+function Answer({ text, live }: { text: string; live: boolean }) {
   return (
-    <div>
-      <p className="answer" aria-live={live ? "polite" : undefined}>
-        <span className="whisper">Answer</span>
-        {text}
-      </p>
-      {citations.length > 0 ? (
-        <div className="source">
-          <p>From: {citations.map((item) => item.label).join("; ")}</p>
-          <button
-            type="button"
-            aria-expanded={open}
-            aria-controls={panelId}
-            onClick={() => setOpen((current) => !current)}
-          >
-            {open ? "Hide the policy text" : "Show the policy text"}
-          </button>
-          {open ? (
-            <div id={panelId}>
-              {citations.map((item) => (
-                <div key={`${item.label}-${item.image || "text"}`}>
-                  <p>{item.text}</p>
-                  {item.image
-                    ? item.image.split("|").map((src) => (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img key={src} src={src} alt="" />
-                      ))
-                    : null}
-                </div>
-              ))}
+    <div className="answer" aria-live={live ? "polite" : undefined}>
+      <span className="whisper">Answer</span>
+      <Formatted text={text} />
+    </div>
+  );
+}
+
+function LinkText({ text }: { text: string }) {
+  const parts = text.split(/(https?:\/\/[^\s)]+)/g);
+  return parts.map((part, index) => {
+    if (!part.startsWith("http")) return <span key={`t-${index}`}>{part}</span>;
+    const href = part.replace(/[.,]$/, "");
+    return (
+      <a key={`u-${index}`} href={href} target="_blank" rel="noopener noreferrer">
+        {href}
+      </a>
+    );
+  });
+}
+
+function Formatted({ text, labels = [] }: { text: string; labels?: string[] }) {
+  const blocks = formatAnswer(text, labels);
+  return (
+    <div className="answer-copy">
+      {blocks.map((block, index) => {
+        if (block.type === "table") {
+          return (
+            <div className="table-wrap" key={`table-${index}`}>
+              {block.caption ? <p className="table-caption">{block.caption}</p> : null}
+              <table className="answer-table">
+                <thead>
+                  <tr>
+                    {block.headers.map((header, column) => (
+                      <th key={column} scope="col">
+                        {header}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={`row-${rowIndex}`}>
+                      {row.map((cell, cellIndex) =>
+                        block.headers[0] === "Item" && cellIndex === 0 ? (
+                          <th key={`cell-${cellIndex}`} scope="row">
+                            <LinkText text={cell} />
+                          </th>
+                        ) : (
+                          <td key={`cell-${cellIndex}`}>
+                            <LinkText text={cell} />
+                          </td>
+                        ),
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
-          ) : null}
-        </div>
-      ) : null}
+          );
+        }
+        if (block.type === "list") {
+          return (
+            <ul key={`list-${index}`}>
+              {block.items.map((item, itemIndex) => (
+                <li key={`item-${itemIndex}`}>
+                  <LinkText text={item} />
+                </li>
+              ))}
+            </ul>
+          );
+        }
+        return (
+          <p key={`line-${index}`}>
+            <LinkText text={block.text} />
+          </p>
+        );
+      })}
     </div>
   );
 }

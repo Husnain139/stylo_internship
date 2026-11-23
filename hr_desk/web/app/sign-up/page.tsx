@@ -5,54 +5,57 @@ import { useRouter } from "next/navigation";
 import { useEffect, useId, useState } from "react";
 import { PasswordField } from "@/components/password-field";
 import { useSession } from "@/components/session";
+import { api } from "@/lib/api";
 
 export default function SignUpPage() {
   const router = useRouter();
-  const { me, signUp } = useSession();
+  const { me, localPasswordSetup, setInitialPassword, activate } = useSession();
   const emailId = useId();
-  const emailHelpId = useId();
   const passwordId = useId();
-  const ruleId = useId();
+  const noteId = useId();
+  const [token, setToken] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  const [emailInvalid, setEmailInvalid] = useState(false);
-  const [passwordInvalid, setPasswordInvalid] = useState(false);
   const [busy, setBusy] = useState(false);
-  const longEnough = password.length >= 8;
+  const activation = !localPasswordSetup && Boolean(token);
+  const needsPassword = localPasswordSetup || activation;
+
+  useEffect(() => {
+    const code = window.location.hash.slice(1);
+    if (code) {
+      setToken(code);
+      window.history.replaceState(window.history.state, "", window.location.pathname);
+    }
+  }, []);
 
   useEffect(() => {
     if (me) router.replace("/");
   }, [me, router]);
 
-  if (me) {
-    return <p role="status">Signing in…</p>;
-  }
+  if (me) return <p role="status">Signing in...</p>;
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    const missingEmail = email.trim() === "";
-    const shortPassword = password.length < 8;
-    setEmailInvalid(missingEmail);
-    setPasswordInvalid(shortPassword);
-    if (missingEmail || shortPassword) {
-      setError(
-        missingEmail && shortPassword
-          ? "Enter your work email and a password of at least 8 characters."
-          : missingEmail
-            ? "Enter the work email HR has for you."
-            : "Use at least 8 characters.",
-      );
-      return;
-    }
     setError("");
     setBusy(true);
     try {
-      await signUp(email.trim(), password);
-      router.push("/");
+      if (localPasswordSetup) {
+        await setInitialPassword(email.trim(), password);
+        router.replace("/");
+      } else if (activation) {
+        await activate(token, password);
+        router.replace("/");
+      } else {
+        const response = await api<{ message: string }>("/api/sign-up", {
+          method: "POST",
+          body: JSON.stringify({ email: email.trim() }),
+        });
+        setMessage(response.message);
+      }
     } catch (caught) {
-      setEmailInvalid(true);
-      setError(caught instanceof Error ? caught.message : "This email is not on the employee list.");
+      setError(caught instanceof Error ? caught.message : "Please try again.");
     } finally {
       setBusy(false);
     }
@@ -61,62 +64,35 @@ export default function SignUpPage() {
   return (
     <section className="stack auth">
       <header className="page-head">
-        <h1>Create a password</h1>
-        <p className="lead">HR already has your name and email. You only choose a password.</p>
+        <h1>{activation ? "Choose a password" : "Set up your account"}</h1>
+        {!needsPassword ? <p className="lead">We’ll email you a setup link.</p> : null}
       </header>
-      <form className="panel" noValidate onSubmit={(event) => void submit(event)}>
-        <div className="field">
-          <label htmlFor={emailId}>Work email</label>
-          <input
-            id={emailId}
-            name="email"
-            type="email"
-            autoComplete="username"
-            autoCapitalize="none"
-            spellCheck={false}
-            inputMode="email"
-            value={email}
-            aria-invalid={emailInvalid || undefined}
-            aria-describedby={emailHelpId}
-            onChange={(event) => {
-              setEmail(event.target.value);
-              setEmailInvalid(false);
-            }}
-          />
-          <p id={emailHelpId} className="help">
-            Use the email on your employee record. Your name and role stay as they are.
-          </p>
-        </div>
-        <div className="field">
-          <label htmlFor={passwordId}>Password</label>
-          <PasswordField
-            id={passwordId}
-            name="password"
-            autoComplete="new-password"
-            value={password}
-            describedBy={ruleId}
-            invalid={passwordInvalid}
-            onChange={(value) => {
-              setPassword(value);
-              setPasswordInvalid(false);
-            }}
-          />
-          <p id={ruleId} className={longEnough ? "requirement met" : passwordInvalid ? "requirement bad" : "requirement"}>
-            {longEnough ? "Long enough to use." : "At least 8 characters."}
-          </p>
-        </div>
-        {error ? (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
+      <form className="panel" onSubmit={(event) => void submit(event)}>
+        {!activation ? (
+          <div className="field">
+            <label htmlFor={emailId}>Work email</label>
+            <input id={emailId} type="email" autoComplete="username" required maxLength={254}
+              value={email} onChange={(event) => setEmail(event.target.value)} />
+          </div>
         ) : null}
-        <button className="primary" type="submit" disabled={busy}>
-          {busy ? "Creating your password…" : "Create password"}
+        {needsPassword ? (
+          <div className="field">
+            <label htmlFor={passwordId}>New password</label>
+            <PasswordField id={passwordId} name="password" autoComplete="new-password"
+              value={password} onChange={setPassword} describedBy={noteId} />
+            <p className="help" id={noteId}>At least 12 characters.</p>
+          </div>
+        ) : null}
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        {message ? <p className="success" role="status">{message}</p> : null}
+        <button className="primary" disabled={busy || (needsPassword && password.length < 12)}>
+          {busy ? (needsPassword ? "Saving…" : "Sending…") : needsPassword ? "Set password" : "Send setup link"}
         </button>
       </form>
-      <p className="switch-line">
-        Already have a password? <Link href="/sign-in">Sign in</Link>
-      </p>
+      {activation ? <button type="button" onClick={() => { setToken(""); setPassword(""); setError(""); }}>
+        Request a new setup link
+      </button> : null}
+      <p className="switch-line"><Link href="/sign-in">Back to sign in</Link></p>
     </section>
   );
 }

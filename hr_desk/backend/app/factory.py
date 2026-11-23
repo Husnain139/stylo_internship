@@ -4,28 +4,14 @@ from __future__ import annotations
 
 import os
 
-from dotenv import load_dotenv
-
-from .config import DESK_ROOT, openai_api_key
+from .activation import allows_local_password_setup, validate_deployment
+from .config import openai_api_key
 from .llm import OpenAIBackend
 from .pipeline import Pipeline
 
-load_dotenv(DESK_ROOT / ".env")
-
-
-def sync_library(store, embedder) -> None:
-    from .ingest import load_office_policies
-
-    office = load_office_policies()
-    if not office:
-        return
-    _sync(store, embedder, office)
-
-
-def _sync(store, embedder, policies) -> None:
+def index_missing_policies(store, embedder, policies) -> None:
     from .ingest import make_chunks as chunk_policy
 
-    store.delete_docs_except({policy.id for policy in policies})
     for policy in policies:
         if store.has_policy(policy.id):
             continue
@@ -38,32 +24,35 @@ def open_store():
     dsn = os.environ.get("DATABASE_URL", "").strip()
     if not dsn:
         raise RuntimeError("DATABASE_URL is required.")
+    validate_deployment(dsn)
     from .store_pg import PostgresStore
 
-    return PostgresStore(dsn)
+    local_setup = allows_local_password_setup()
+    store = PostgresStore(dsn)
+    if not local_setup:
+        with store.conn.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT 1 FROM employees WHERE split_part(email, '@', 2) = 'stylo.example')")
+            sample_accounts_present = cur.fetchone()[0]
+        if sample_accounts_present:
+            store.conn.close()
+            raise RuntimeError("Remove sample employee accounts before enabling company access.")
+    store.ping()
+    return store
 
 
-def build_embedder():
+def build_embedder(store):
     key = openai_api_key()
     if not key:
         raise RuntimeError("OPENAI_API_KEY is required.")
     from openai import OpenAI
 
-    return OpenAIBackend(OpenAI(api_key=key))
+    def reserve():
+        store.consume_budget([("provider:daily", 3000, 86400)])
 
-
-def build_llm():
-    key = openai_api_key()
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY is required.")
-    from openai import OpenAI
-
-    return OpenAIBackend(OpenAI(api_key=key))
+    return OpenAIBackend(OpenAI(api_key=key, max_retries=0), reserve)
 
 
 def build_pipeline() -> Pipeline:
     store = open_store()
-    embedder = build_embedder()
-    llm = build_llm()
-    sync_library(store, embedder)
-    return Pipeline(store, embedder, llm)
+    provider = build_embedder(store)
+    return Pipeline(store, provider, provider)

@@ -1,6 +1,7 @@
 node_modules/
 .next/
 hr_desk/backend/evals/last_run.json
+hr_desk/.runtime/
 
 .venv/
 venv/

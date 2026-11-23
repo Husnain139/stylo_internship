@@ -6,14 +6,15 @@ import { useSession } from "@/components/session";
 
 const ADMIN_LINKS = [
   { href: "/policies", label: "Policies" },
-  { href: "/questions", label: "Questions people asked" },
+  { href: "/people", label: "People" },
+  { href: "/questions", label: "Questions" },
   { href: "/checks", label: "Checks" },
 ];
 
 export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const { loading, me, signOut } = useSession();
-  const links = me ? [{ href: "/", label: "Ask about a policy" }, ...(me.isAdmin ? ADMIN_LINKS : [])] : [];
+  const links = me ? [{ href: "/", label: "Ask HR" }, ...(me.isAdmin ? ADMIN_LINKS : [])] : [];
 
   return (
     <>
@@ -25,9 +26,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           <Link className="brand" href="/">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="/logo.png" alt="Stylo" width={148} height={56} />
-            <span>
-              <strong>HR Desk</strong>
-            </span>
+            <strong>HR Desk</strong>
           </Link>
           {me ? (
             <div className="who">

@@ -10,9 +10,7 @@ export default function SignInPage() {
   const router = useRouter();
   const { me, signIn } = useSession();
   const emailId = useId();
-  const emailHelpId = useId();
   const passwordId = useId();
-  const passwordHelpId = useId();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -62,7 +60,6 @@ export default function SignInPage() {
     <section className="stack auth">
       <header className="page-head">
         <h1>Sign in</h1>
-        <p className="lead">Use the work email and password you created for HR Desk.</p>
       </header>
       <form className="panel" noValidate onSubmit={(event) => void submit(event)}>
         <div className="field">
@@ -77,15 +74,11 @@ export default function SignInPage() {
             inputMode="email"
             value={email}
             aria-invalid={emailInvalid || undefined}
-            aria-describedby={emailHelpId}
             onChange={(event) => {
               setEmail(event.target.value);
               setEmailInvalid(false);
             }}
           />
-          <p id={emailHelpId} className="help">
-            The email on your employee record.
-          </p>
         </div>
         <div className="field">
           <label htmlFor={passwordId}>Password</label>
@@ -94,16 +87,12 @@ export default function SignInPage() {
             name="password"
             autoComplete="current-password"
             value={password}
-            describedBy={passwordHelpId}
             invalid={passwordInvalid}
             onChange={(value) => {
               setPassword(value);
               setPasswordInvalid(false);
             }}
           />
-          <p id={passwordHelpId} className="help">
-            The password you chose for HR Desk.
-          </p>
         </div>
         {error ? (
           <p className="form-error" role="alert">
@@ -115,7 +104,7 @@ export default function SignInPage() {
         </button>
       </form>
       <p className="switch-line">
-        First time here? <Link href="/sign-up">Create a password</Link>
+        First time here? <Link href="/sign-up">Set up your account</Link>
       </p>
     </section>
   );

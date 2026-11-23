@@ -5,16 +5,13 @@ from __future__ import annotations
 import re
 import shutil
 from datetime import date
-from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
-from .config import BACKEND_ROOT
+from .config import DATA_ROOT
 from .models import ChunkDraft, PolicyDraft
 
-POLICY_DIR = BACKEND_ROOT / "data" / "policies"
-CHUNK_CHARS = 3200
-CHUNK_OVERLAP = 400
+POLICY_DIR = DATA_ROOT / "policies"
 _OFFICE_SUFFIXES = (".pdf", ".docx")
 
 
@@ -62,30 +59,14 @@ def _sections(body: str) -> list[tuple[str, str]]:
     return [("", text)] if text else []
 
 
-def _windows(text: str) -> list[str]:
-    if len(text) <= CHUNK_CHARS:
-        return [text]
-    parts: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + CHUNK_CHARS)
-        piece = text[start:end].strip()
-        if piece:
-            parts.append(piece)
-        if end == len(text):
-            break
-        start = max(0, end - CHUNK_OVERLAP)
-        if start >= end:
-            break
-    return parts
-
-
 def make_chunks(policy: PolicyDraft) -> list[ChunkDraft]:
+    from .passages import _split_section
+
     chunks: list[ChunkDraft] = []
     for heading, text in _sections(policy.body):
         label = f"{policy.title}, {heading}" if heading else policy.title
-        for piece in _windows(text):
-            embed_text = "\n".join(part for part in (policy.title, heading, piece) if part)
+        for piece in _split_section(text):
+            embed_text = "\n".join(part for part in (policy.title[:200], heading[:600], piece) if part)
             chunks.append(
                 ChunkDraft(
                     section_label=label,
@@ -95,34 +76,6 @@ def make_chunks(policy: PolicyDraft) -> list[ChunkDraft]:
                 )
             )
     return chunks
-
-
-def read_upload(filename: str, payload: bytes) -> str:
-    name = (filename or "").lower()
-    if name.endswith(".pdf"):
-        import pymupdf
-
-        document = pymupdf.open(stream=payload, filetype="pdf")
-        try:
-            return "\n".join(page.get_text("text") or "" for page in document).strip()
-        finally:
-            document.close()
-    if name.endswith(".docx"):
-        return _docx_text(payload)
-    return payload.decode("utf-8", errors="replace").strip()
-
-
-def _docx_text(payload: bytes) -> str:
-    from docx import Document
-
-    document = Document(BytesIO(payload))
-    parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if cells:
-                parts.append(" | ".join(cells))
-    return "\n".join(parts).strip()
 
 
 def folder_filenames() -> dict[str, str]:
@@ -153,20 +106,13 @@ def find_policy_file(policy_id: str) -> Path | None:
     return None
 
 
-def remove_policy_files(
-    policy_id: str,
-    keep_file: Path | None = None,
-    keep_media: bool = False,
-) -> None:
-    """Drop the source file and saved pictures so a restart cannot bring the policy back."""
+def remove_policy_files(policy_id: str) -> None:
+    """Remove files belonging to a discarded or expired draft."""
     source = find_policy_file(policy_id)
     if source is not None and _inside(source, POLICY_DIR):
-        if keep_file is None or source.resolve() != keep_file.resolve():
-            source.unlink()
-    if keep_media:
-        return
-    media = BACKEND_ROOT / "data" / "policy_media" / policy_id
-    if media.exists() and _inside(media, BACKEND_ROOT / "data" / "policy_media"):
+        source.unlink()
+    media = DATA_ROOT / "policy_media" / policy_id
+    if media.exists() and _inside(media, DATA_ROOT / "policy_media"):
         shutil.rmtree(media)
 
 
@@ -174,29 +120,32 @@ def replacement_policy(
     title: str,
     audience: str,
     effective_from: date,
+    effective_to: date | None,
     text: str,
     filename: str,
     payload: bytes,
-    previous: Path | None,
 ) -> tuple[PolicyDraft, Path | None]:
     """Build the policy that replaces an old one. PDF and Word keep the full reader."""
     suffix = Path(filename).suffix.lower() if filename else ""
     if payload and suffix in _OFFICE_SUFFIXES:
         from .passages import policy_from_bytes
 
-        stored_name = _destination_name(filename, previous)
+        stored_name = _destination_name(filename)
         try:
             policy = policy_from_bytes(stored_name, payload)
         except Exception as exc:
             raise ValueError("unreadable") from exc
         if policy is None or not policy.chunks:
             raise ValueError("unreadable")
-        _retitle(policy, title, audience, effective_from)
-        policy.source_name = stored_name
+        _retitle(policy, title, audience, effective_from, effective_to)
+        policy.source_name = Path(filename).name
         return policy, POLICY_DIR / stored_name
     body = text.strip()
     if payload and filename:
-        body = read_upload(filename, payload).strip()
+        try:
+            body = payload.decode("utf-8-sig").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError("unreadable") from exc
     if not body:
         raise ValueError("empty")
     policy = PolicyDraft(
@@ -204,7 +153,7 @@ def replacement_policy(
         title=title,
         audience=audience,
         effective_from=effective_from,
-        effective_to=None,
+        effective_to=effective_to,
         body=body,
         source_name=Path(filename).name if filename else "",
     )
@@ -216,15 +165,22 @@ def write_policy_file(path: Path, payload: bytes) -> None:
     if not _inside(path, POLICY_DIR):
         raise ValueError("outside")
     POLICY_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    with path.open("xb") as stream:
+        stream.write(payload)
 
 
-def _retitle(policy: PolicyDraft, title: str, audience: str, effective_from: date) -> None:
+def _retitle(
+    policy: PolicyDraft,
+    title: str,
+    audience: str,
+    effective_from: date,
+    effective_to: date | None,
+) -> None:
     old = policy.title
     policy.title = title
     policy.audience = audience
     policy.effective_from = effective_from
-    policy.effective_to = None
+    policy.effective_to = effective_to
     for chunk in policy.chunks or []:
         if old and (chunk.section_label == old or chunk.section_label.startswith(old + ", ")):
             chunk.section_label = title + chunk.section_label[len(old) :]
@@ -234,12 +190,8 @@ def _retitle(policy: PolicyDraft, title: str, audience: str, effective_from: dat
             chunk.embed_text = "\n".join(lines)
 
 
-def _destination_name(filename: str, previous: Path | None) -> str:
+def _destination_name(filename: str) -> str:
     safe = _safe_filename(filename)
-    if previous is not None and previous.name == safe:
-        return safe
-    if not (POLICY_DIR / safe).exists():
-        return safe
     stem = Path(safe).stem
     suffix = Path(safe).suffix
     return f"{stem}-{uuid4().hex[:8]}{suffix}"

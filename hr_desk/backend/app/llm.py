@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+import time
+from threading import Event
+
+from openai import APIConnectionError, APIStatusError
+
 from .config import (
     CLASSIFIER_MAX_TOKENS,
     REWRITE_MAX_TOKENS,
@@ -31,46 +38,79 @@ _REWRITE_SYSTEM = (
 )
 
 
-def _parameter_rejected(exc: Exception) -> bool:
-    message = str(exc).lower()
-    markers = (
-        "temperature",
-        "max_tokens",
-        "max_completion_tokens",
-        "reasoning_effort",
-        "unsupported",
-        "unrecognized",
-    )
-    return any(marker in message for marker in markers)
+_deadline: ContextVar[float | None] = ContextVar("provider_deadline", default=None)
+_cancelled: ContextVar[Event | None] = ContextVar("provider_cancelled", default=None)
+
+
+def request_cancelled() -> bool:
+    event = _cancelled.get()
+    return event is not None and event.is_set()
+
+
+@contextmanager
+def provider_deadline(seconds: int, cancelled: Event | None = None):
+    cancel_token = _cancelled.set(cancelled)
+    token = _deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+        _cancelled.reset(cancel_token)
 
 
 class OpenAIBackend:
-    def __init__(self, client) -> None:
+    def __init__(self, client, reserve_call=None) -> None:
         self.client = client
+        self.reserve_call = reserve_call
+
+    def _request(self, operation, timeout):
+        overall = _deadline.get() or time.monotonic() + timeout
+        for attempt in range(2):
+            if request_cancelled():
+                raise InterruptedError("The client stopped waiting.")
+            remaining = overall - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("OpenAI request deadline exceeded")
+            if self.reserve_call:
+                self.reserve_call()
+            try:
+                return operation(self.client.with_options(timeout=min(remaining, timeout), max_retries=0))
+            except (APIConnectionError, APIStatusError) as exc:
+                status = getattr(exc, "status_code", None)
+                if attempt or (status and status not in {408, 409, 429, 500, 502, 503, 504}):
+                    raise
+                retry_after = 0.5
+                response = getattr(exc, "response", None)
+                if response is not None:
+                    try:
+                        retry_after = max(retry_after, float(response.headers.get("retry-after", "0")))
+                    except ValueError:
+                        pass
+                if overall - time.monotonic() <= retry_after + 1:
+                    raise
+                time.sleep(retry_after)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        if any(len(text.encode("utf-8")) > 7500 for text in texts):
+            raise ValueError("An embedding input exceeds the safe size.")
         vectors: list[list[float]] = []
         for start in range(0, len(texts), 64):
             batch = texts[start : start + 64]
-            response = self.client.embeddings.create(
-                model=embed_model(),
-                input=batch,
-                dimensions=1536,
+            response = self._request(
+                lambda client: client.embeddings.create(model=embed_model(), input=batch, dimensions=1536),
+                12,
             )
             ordered = sorted(response.data, key=lambda item: item.index)
             vectors.extend(item.embedding for item in ordered)
         return vectors
 
     def moderate(self, text: str) -> bool:
-        try:
-            response = self.client.with_options(timeout=TIMEOUT_MODERATION_S).moderations.create(
-                model="omni-moderation-latest",
-                input=text[:1000],
-            )
-        except Exception:
-            return False
+        response = self._request(
+            lambda client: client.moderations.create(model="omni-moderation-latest", input=text[:1000]),
+            TIMEOUT_MODERATION_S,
+        )
         result = response.results[0]
         categories = result.categories
         data = categories.model_dump() if hasattr(categories, "model_dump") else dict(categories)
@@ -88,7 +128,7 @@ class OpenAIBackend:
             timeout=TIMEOUT_CLASSIFIER_S,
         )
         word = (reply or "").strip().lower()
-        if word.startswith("allow"):
+        if word == "allow":
             return "allow"
         return "block"
 
@@ -108,7 +148,7 @@ class OpenAIBackend:
             temperature=TEMPERATURE_CLASSIFIER,
             timeout=TIMEOUT_CLASSIFIER_S,
         )
-        cleaned = (reply or "").strip().splitlines()[0].strip(" \"'")
+        cleaned = reply.strip().splitlines()[0].strip(" \"'")
         return cleaned[:300] or question
 
     def answer(
@@ -135,49 +175,23 @@ class OpenAIBackend:
             temperature=TEMPERATURE_ANSWER,
             timeout=TIMEOUT_ANSWER_S,
         )
-        return Completion(text=text, tokens_in=tokens_in, tokens_out=tokens_out, model=model)
+        return Completion(text=text, tokens_in=tokens_in, tokens_out=tokens_out)
 
     def _chat(self, *, model, messages, max_tokens, temperature, timeout):
-        # gpt-5 spends the token cap on hidden reasoning unless effort is minimal,
-        # and it rejects any temperature other than the default. Try the call that
-        # this model accepts first, then fall back for older models.
-        attempts = [
-            {"max_completion_tokens": max_tokens, "reasoning_effort": "minimal"},
-            {
-                "temperature": temperature,
-                "max_completion_tokens": max_tokens,
-                "reasoning_effort": "minimal",
-            },
-            {"temperature": temperature, "max_tokens": max_tokens, "reasoning_effort": "minimal"},
-            {"max_tokens": max_tokens, "reasoning_effort": "minimal"},
-            {"temperature": temperature, "max_completion_tokens": max_tokens},
-            {"max_completion_tokens": max_tokens},
-            {"temperature": temperature, "max_tokens": max_tokens},
-            {"max_tokens": max_tokens},
-        ]
-        last_error: Exception | None = None
-        for extra in attempts:
-            try:
-                response = self.client.with_options(timeout=timeout).chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    **extra,
-                )
-                choice = response.choices[0].message.content or ""
-                if not choice.strip():
-                    raise RuntimeError("The model returned an empty answer.")
-                usage = response.usage
-                return (
-                    choice,
-                    int(getattr(usage, "prompt_tokens", 0) or 0),
-                    int(getattr(usage, "completion_tokens", 0) or 0),
-                )
-            except Exception as exc:
-                last_error = exc
-                if not _parameter_rejected(exc):
-                    raise
-        assert last_error is not None
-        raise last_error
+        options = {"max_completion_tokens": max_tokens}
+        if model.startswith("gpt-5"):
+            options["reasoning_effort"] = "minimal" if model.startswith(("gpt-5-nano", "gpt-5-mini")) else "low"
+        else:
+            options["temperature"] = temperature
+        response = self._request(
+            lambda client: client.chat.completions.create(model=model, messages=messages, **options),
+            timeout,
+        )
+        choice = response.choices[0].message.content or ""
+        if not choice.strip():
+            raise RuntimeError("The model returned an empty answer.")
+        usage = response.usage
+        return choice, int(getattr(usage, "prompt_tokens", 0) or 0), int(getattr(usage, "completion_tokens", 0) or 0)
 
 
 def _nano() -> str:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextvars import ContextVar
+from zipfile import ZipFile
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -13,9 +15,9 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from .ingest import CHUNK_CHARS, CHUNK_OVERLAP
+from .config import CHUNK_CHARS, CHUNK_OVERLAP
 from .models import ChunkDraft, PolicyDraft
-from .transcribe import known_picture_text, save_picture, transcribe_picture
+from .transcribe import save_picture, transcribe_picture
 
 _MONTHS = {
     "jan": 1,
@@ -36,32 +38,37 @@ _MEDICAL_PLANS = (
     (
         "Plan A",
         "COO, Director, CEO, CFO, HEAD, AGM, GM, Higher Management",
-        "Hospitalization benefit 500,000. Room and board limit per day 12,000. "
-        "Normal delivery 100,000. Complicated or Caesarean delivery 180,000.",
+        "Hospitalization Benefit (Employee, Spouse and Children): 500,000. "
+        "Room & Board Limit (per day): 12,000. Normal Delivery: 100,000. "
+        "Complicated /Caesarean Delivery: 180,000.",
     ),
     (
         "Plan B",
-        "Manager, Assistant Manager, Senior Manager, Middle Management",
-        "Hospitalization benefit 400,000. Room and board limit per day 10,000. "
-        "Normal delivery 80,000. Complicated or Caesarean delivery 160,000.",
+        "Manager, Assistant, Sr. Manager, Middle Management",
+        "Hospitalization Benefit (Employee, Spouse and Children): 400,000. "
+        "Room & Board Limit (per day): 10,000. Normal Delivery: 80,000. "
+        "Complicated /Caesarean Delivery: 160,000.",
     ),
     (
         "Plan C",
         "Executive, Designer, Lower Management",
-        "Hospitalization benefit 300,000. Room and board limit per day 7,000. "
-        "Normal delivery 70,000. Complicated or Caesarean delivery 120,400.",
+        "Hospitalization Benefit (Employee, Spouse and Children): 300,000. "
+        "Room & Board Limit (per day): 7,000. Normal Delivery: 70,000. "
+        "Complicated /Caesarean Delivery: 120,400.",
     ),
     (
         "Plan D",
         "Officers, Supervisor, Support Staff",
-        "Hospitalization benefit 250,000. Room and board limit per day 5,000. "
-        "Normal delivery 60,000. Complicated or Caesarean delivery 100,200.",
+        "Hospitalization Benefit (Employee, Spouse and Children): 250,000. "
+        "Room & Board Limit (per day): 5,000. Normal Delivery: 60,000. "
+        "Complicated /Caesarean Delivery: 100,200.",
     ),
     (
         "Plan E",
         "Other Staff",
-        "Hospitalization benefit 200,000. Room and board limit per day 5,000. "
-        "Normal delivery 50,000. Complicated or Caesarean delivery 70,000.",
+        "Hospitalization Benefit (Employee, Spouse and Children): 200,000. "
+        "Room & Board Limit (per day): 5,000. Normal Delivery: 50,000. "
+        "Complicated /Caesarean Delivery: 70,000.",
     ),
 )
 
@@ -96,30 +103,48 @@ def file_policy_id(filename: str, payload: bytes) -> str:
     return "doc-" + hashlib.sha256(name.encode("utf-8") + b"\0" + payload).hexdigest()[:16]
 
 
+_TRAVEL_SHA256 = "3ef8c6a2dc6752bdc72de778abdc4056e467c695083a4be472f0c4792cd098b8"
+_MEDICAL_SHA256 = "15dfd201ee84c93f072b04941540c8a1a4180eacfb785920d668eaa003c97537"
+_reader_notes: ContextVar[list[str] | None] = ContextVar("reader_notes", default=None)
+
+
+def _note(message: str) -> None:
+    notes = _reader_notes.get()
+    if notes is not None and message not in notes:
+        notes.append(message)
+
+
 def policy_from_bytes(filename: str, payload: bytes) -> PolicyDraft | None:
     name = Path(filename).name
     path = Path(name)
     policy_id = file_policy_id(name, payload)
-    suffix = path.suffix.lower()
-    if suffix == ".docx":
-        chunks, title, effective = _docx(path, payload, policy_id)
-    elif suffix == ".pdf":
-        chunks, title, effective = _pdf(path, payload, policy_id)
-    else:
-        return None
+    notes: list[str] = []
+    handle = _reader_notes.set(notes)
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".docx":
+            with ZipFile(BytesIO(payload)) as package:
+                entries = package.infolist()
+                if len(entries) > 3000 or sum(entry.file_size for entry in entries) > 128 * 1024 * 1024:
+                    raise ValueError("This Word file expands beyond the processing limit.")
+                if any(entry.filename.endswith("vbaProject.bin") for entry in entries):
+                    raise ValueError("Upload a Word file without macros.")
+            chunks, title, effective = _docx(path, payload, policy_id)
+        elif suffix == ".pdf":
+            chunks, title, effective = _pdf(path, payload, policy_id)
+        else:
+            return None
+    finally:
+        _reader_notes.reset(handle)
     if not chunks:
         return None
+    if len(chunks) > 500:
+        raise ValueError("This policy needs more than 500 searchable passages. Upload it in separate parts.")
     if effective is None:
         effective = _filename_date(path) if _filename_date_allowed(path) else date(2025, 1, 1)
-    body = "\n\n".join(chunk.body for chunk in chunks)
     return PolicyDraft(
-        id=policy_id,
-        title=title,
-        audience="everyone",
-        effective_from=effective,
-        effective_to=None,
-        body=body,
-        chunks=chunks,
+        id=policy_id, title=title, audience="everyone", effective_from=effective, effective_to=None,
+        body="\n\n".join(chunk.body for chunk in chunks), source_name=name, chunks=chunks, warnings=notes,
     )
 
 
@@ -240,8 +265,7 @@ class _DocxReader:
         images = _paragraph_images(paragraph)
         if level is not None and text:
             self._flush()
-            number = self.numbers.label(paragraph)
-            shown = f"{number} {text}".strip() if number else text
+            shown = _with_number(self.numbers.label(paragraph), text)
             self._release_unused(level)
             self.stack = [item for item in self.stack if item[0] < level]
             self.stack.append((level, shown, False))
@@ -250,8 +274,9 @@ class _DocxReader:
                 self._image(name, blob)
             return
         if text:
-            self.buffer.append(text)
+            self.buffer.append(_with_number(self.numbers.label(paragraph), text))
             self.before = text
+        self.buffer.extend(url for url in _paragraph_urls(paragraph) if url not in text)
         for name, blob in images:
             self._image(name, blob)
 
@@ -260,26 +285,71 @@ class _DocxReader:
         if _skip_picture(name, blob, self.before, heading):
             return
         if name.lower().endswith(".emf"):
-            transcript = known_picture_text(heading) or transcribe_picture(blob, heading)
+            transcript = transcribe_picture(blob)
             if transcript:
                 self.images.append(("", transcript))
+            else:
+                _note(f"{heading}: a Word drawing could not be transcribed.")
             return
         stored = save_picture(self.policy_id, name, blob)
-        transcript = transcribe_picture(blob, heading)
+        transcript = transcribe_picture(blob)
         self.images.append((stored, transcript))
+        if not transcript:
+            _note(f"{heading}: a picture has no searchable transcription.")
 
     def _table(self, table: Table) -> None:
+        self._table_rows(table)
+        seen_cells = set()
+        for row_number, row in enumerate(table.rows, start=1):
+            for column_number, cell in enumerate(row.cells, start=1):
+                if cell._tc in seen_cells:
+                    continue
+                seen_cells.add(cell._tc)
+                for paragraph in cell.paragraphs:
+                    for name, image in _paragraph_images(paragraph):
+                        self._image(name, image)
+                self._flush()
+                for index, nested in enumerate(cell.tables, start=1):
+                    self._stack_table(nested, f"Nested table {index} (row {row_number}, column {column_number})")
+
+    def _stack_table(self, table: Table, heading: str) -> None:
+        depth = self.stack[-1][0] + 1 if self.stack else 1
+        self.stack.append((depth, heading, True))
+        try:
+            self._table(table)
+        finally:
+            self.stack.pop()
+
+    def _table_rows(self, table: Table) -> None:
         rows = [_row_cells(row) for row in table.rows]
         rows = [row for row in rows if any(cell for cell in row)]
         if not rows:
             return
         banner = _table_banner(rows)
+        if banner:
+            self._release_unused(0)
         heading = banner or self._heading()
         if banner:
             parents = [part for part in self._path().split(" > ") if part and part != self._heading()]
             path = " > ".join([*parents, banner])
         else:
             path = self._path()
+        pairs = _key_value_pairs(rows)
+        if pairs is not None:
+            for left, right in pairs:
+                body = f"{left} {right}" if left.endswith(":") else f"{left}: {right}"
+                self.found.extend(
+                    _chunks(
+                        self.title,
+                        path,
+                        heading,
+                        body,
+                        content_type="table",
+                        polarity=_polarity(heading, body),
+                    )
+                )
+                self._mark_used()
+            return
         header, data = _table_header(rows)
         if not data:
             return
@@ -392,6 +462,18 @@ def _bold_heading(paragraph: Paragraph, text: str) -> bool:
     return len(words) <= 12 or text.endswith(":")
 
 
+def _paragraph_urls(paragraph: Paragraph) -> list[str]:
+    urls = []
+    for node in paragraph._p.xpath(".//w:hyperlink"):
+        rid = node.get(qn("r:id"))
+        if not rid or rid not in paragraph.part.rels:
+            continue
+        relation = paragraph.part.rels[rid]
+        if relation.is_external and re.match(r"^https?://", relation.target_ref, re.I):
+            urls.append(relation.target_ref)
+    return list(dict.fromkeys(urls))
+
+
 def _paragraph_images(paragraph: Paragraph) -> list[tuple[str, bytes]]:
     found = []
     for blip in paragraph._p.xpath(".//a:blip"):
@@ -442,6 +524,32 @@ def _table_header(rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
     if _header_is_data(header):
         return [], rows[start:]
     return header, data
+
+
+def _key_value_pairs(rows: list[list[str]]) -> list[tuple[str, str]] | None:
+    """A label-and-value table has no column titles. The first row is data, not a header."""
+    pairs: list[tuple[str, str]] = []
+    for row in rows:
+        cells = [cell for cell in row if cell]
+        if len(cells) == 1:
+            continue
+        if len(cells) != 2:
+            return None
+        pairs.append((cells[0], cells[1]))
+    if len(pairs) < 2:
+        return None
+    left, right = pairs[0]
+    later_values = [value for _label, value in pairs[1:]]
+    header_like = len(left) <= 20 and len(right) <= 24 and any(len(value) > len(right) + 20 for value in later_values)
+    if header_like:
+        return None
+    return pairs
+
+
+def _with_number(number: str, text: str) -> str:
+    if number and not text.startswith(number):
+        return f"{number} {text}".strip()
+    return text
 
 
 def _header_is_data(header: list[str]) -> bool:
@@ -563,16 +671,20 @@ class _WordNumbers:
 def _pdf(path: Path, payload: bytes, policy_id: str) -> tuple[list[ChunkDraft], str, date | None]:
     import pymupdf
 
-    document = pymupdf.open(stream=payload, filetype="pdf")
-    text = "\n".join(page.get_text("text") for page in document)
-    if not text.strip():
-        return _travel(document, policy_id)
-    title = "Medical Insurance Policy" if "medical insurance policy" in text.lower() else path.stem
-    chunks = _text_pdf(document, title, policy_id)
-    return chunks, title, _effective_date("\n".join(chunk.body for chunk in chunks))
+    with pymupdf.open(stream=payload, filetype="pdf") as document:
+        if document.needs_pass or document.page_count > 250:
+            raise ValueError("Use an unlocked PDF with no more than 250 pages.")
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest == _TRAVEL_SHA256:
+            if document.page_count != len(_TRAVEL_PAGES):
+                raise ValueError("The reference travel policy page count changed.")
+            return _travel(document, policy_id)
+        title = "Medical Insurance Policy" if digest == _MEDICAL_SHA256 else path.stem
+        chunks = _text_pdf(document, title, policy_id, medical=digest == _MEDICAL_SHA256)
+        return chunks, title, _effective_date("\n".join(chunk.body for chunk in chunks))
 
 
-def _text_pdf(document, title: str, policy_id: str) -> list[ChunkDraft]:
+def _text_pdf(document, title: str, policy_id: str, *, medical=False) -> list[ChunkDraft]:
     chunks: list[ChunkDraft] = []
     heading = title
     heading_from_line = False
@@ -620,30 +732,69 @@ def _text_pdf(document, title: str, policy_id: str) -> list[ChunkDraft]:
         heading_used = False
         heading_page = page_no
 
+    header_lines: list[str] = []
+
+    def take_headers(raw: str) -> list[str]:
+        _lines, headers = _pdf_lines(raw)
+        for line in headers:
+            if line not in header_lines:
+                header_lines.append(line)
+        return _lines
+
     for index, page in enumerate(document):
         page_no = index + 1
         raw = page.get_text("text")
-        if _is_benefit_page(raw):
+        text_page = None
+        image_content = not medical and bool(page.get_image_info())
+        if not raw.strip() or image_content:
+            dpi = min(150, int(2500 * 72 / max(page.rect.width, page.rect.height, 1)))
+            try:
+                if dpi < 36:
+                    raise ValueError("The page is too large for OCR.")
+                text_page = page.get_textpage_ocr(language="eng", dpi=dpi, full=not raw.strip())
+                raw = page.get_text("text", textpage=text_page)
+                if image_content:
+                    _note(f"Page {page_no}: OCR read the images. Compare the extracted text with the source.")
+            except (RuntimeError, ValueError):
+                _note(f"Page {page_no}: local OCR was unavailable. Images or scanned text may be missing.")
+        if not raw.strip():
+            _note(f"Page {page_no}: no readable text was extracted.")
+        if index and buffer:
+            flush(page_no - 1)
+        if medical and _is_benefit_page(raw):
             flush(page_no)
-            chunks.extend(_benefit_rows(title, page_no))
-            continue
-        if _is_claim_form_page(raw):
-            flush(page_no)
-            image = _save_page(document, index, policy_id, f"page-{page_no}.png")
+            take_headers(raw)
             chunks.extend(
                 _chunks(
                     title,
-                    "Annexure D: In-Patient Claim Form",
-                    "Annexure D: In-Patient Claim Form",
-                    _CLAIM_FORM,
+                    "In-Patient Benefit Entitlement Schedule",
+                    "In-Patient Benefit Entitlement Schedule",
+                    "In-Patient Benefit Entitlement Schedule\nAnnual In-Patient Health\nBenefit",
+                    page=page_no,
+                )
+            )
+            chunks.extend(_benefit_rows(title, page_no))
+            continue
+        if medical and _is_claim_form_page(raw):
+            flush(page_no)
+            take_headers(raw)
+            image = _save_page(document, index, policy_id, f"page-{page_no}.png")
+            claim_title = "Annexure D: In-Patient Claim Form and Required Documents"
+            chunks.extend(
+                _chunks(
+                    title,
+                    claim_title,
+                    claim_title,
+                    f"{claim_title}\n{_CLAIM_FORM}",
                     content_type="form",
                     page=page_no,
                     image_path=image,
                 )
             )
             continue
-        lines = _pdf_lines(raw)
-        if _is_flowchart_page(raw):
+        tables = _pdf_tables(page, page_no) if not medical and raw.strip() else []
+        lines = take_headers(_text_outside_tables(page, tables, text_page) if tables else raw)
+        if medical and _is_flowchart_page(raw):
             flush(page_no)
             prose = [line for line in lines if not _pdf_heading(line)]
             if prose:
@@ -674,27 +825,103 @@ def _text_pdf(document, title: str, policy_id: str) -> list[ChunkDraft]:
                 begin_heading(line, page_no)
             else:
                 buffer.append(line)
+        links = [link.get("uri", "") for link in page.get_links()]
+        buffer.extend(uri for uri in dict.fromkeys(links)
+                      if re.match(r"^https?://", uri, re.I) and uri not in raw)
+        for index_in_page, (_, rows) in enumerate(tables, start=1):
+            table_heading = f"Table {index_in_page} on page {page_no}"
+            headers = [cell or f"Column {index + 1}" for index, cell in enumerate(rows[0])]
+            for row in rows[1:]:
+                description = ". ".join(f"{key}: {value}" for key, value in zip(headers, row) if value)
+                chunks.extend(_chunks(title, f"{heading} > {table_heading}", table_heading,
+                                      description, content_type="table", page=page_no))
     flush(document.page_count or None)
+    if header_lines:
+        chunks.extend(
+            _chunks(
+                title,
+                "Document header",
+                "Document header",
+                "\n".join(header_lines),
+                page=1,
+            )
+        )
     return chunks
 
 
-def _pdf_lines(raw: str) -> list[str]:
+def _pdf_tables(page, page_no):
+    if not hasattr(page, "find_tables"):
+        return []
+    try:
+        found = []
+        for table in page.find_tables().tables:
+            rows = [[(cell or "").strip() for cell in row] for row in table.extract()]
+            if len(rows) >= 2 and len(rows[0]) >= 2:
+                found.append((table.bbox, rows))
+        return found
+    except (RuntimeError, ValueError):
+        _note(f"Page {page_no}: automatic table detection failed.")
+        return []
+
+
+def _text_outside_tables(page, tables, text_page) -> str:
+    lines: dict[tuple[int, int], list[str]] = {}
+    for x0, y0, x1, y1, text, block, line, _ in page.get_text("words", textpage=text_page):
+        x = (x0 + x1) / 2
+        y = (y0 + y1) / 2
+        if not any(left <= x <= right and top <= y <= bottom for (left, top, right, bottom), _ in tables):
+            lines.setdefault((block, line), []).append(text)
+    return "\n".join(" ".join(words) for words in lines.values())
+
+
+def _running_header(text: str) -> bool:
+    folded = text.lower()
+    if folded.startswith("document code") or folded.startswith("revision date") or folded.startswith("revision no"):
+        return True
+    return folded.startswith("page ") and " of " in folded
+
+
+def _pdf_lines(raw: str) -> tuple[list[str], list[str]]:
     lines = []
+    headers = []
     for line in raw.splitlines():
         text = " ".join(line.split())
         if not text:
             continue
-        folded = text.lower()
-        if folded.startswith("document code") or folded.startswith("page ") or "page " in folded and " of " in folded:
+        if _running_header(text):
+            headers.append(text)
             continue
         lines.append(text)
-    return lines
+    return _join_broken_urls(lines), headers
+
+
+def _join_broken_urls(lines: list[str]) -> list[str]:
+    """A web address printed over two lines is one address."""
+    joined: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if re.search(r"https?://\S+$", line) and index + 1 < len(lines):
+            nxt = lines[index + 1].strip()
+            if nxt and " " not in nxt and not re.match(r"^\d", nxt):
+                line = line.rstrip() + nxt
+                index += 1
+        joined.append(line)
+        index += 1
+    return joined
 
 
 def _pdf_heading(line: str) -> bool:
-    if re.match(r"^\d+(\.\d+)*\.?\s+[A-Z]", line):
+    """A short title starts a section. A numbered sentence stays in the section body."""
+    if line.lower().startswith("annexure") and len(line.split()) <= 12:
         return True
-    return line.lower().startswith("annexure")
+    match = re.match(r"^\d+(?:\.\d+)*\.?\s+(\S.*)$", line)
+    if not match:
+        return False
+    rest = match.group(1)
+    if len(rest.split()) > 8 or rest[-1:] in ".,;:":
+        return False
+    return True
 
 
 def _is_benefit_page(raw: str) -> bool:
@@ -717,10 +944,7 @@ def _benefit_rows(title: str, page: int) -> list[ChunkDraft]:
     heading = "Annexure B: In-Patient Medical Benefit Schedule"
     rows = []
     for plan, who, amounts in _MEDICAL_PLANS:
-        body = (
-            f"Plan: {plan}. Grades: {who}. {amounts} "
-            "These amounts are the in-patient benefit for the employee, spouse, and children."
-        )
+        body = f"Plan: {plan}. Grades: {who}. {amounts}"
         rows.extend(_chunks(title, heading, heading, body, content_type="table", page=page))
     return rows
 
@@ -738,6 +962,17 @@ def _travel(document, policy_id: str) -> tuple[list[ChunkDraft], str, date | Non
     chunks: list[ChunkDraft] = []
     for index, page in enumerate(_TRAVEL_PAGES):
         image = _save_page(document, index, policy_id, f"page-{index + 1}.png")
+        page_line = "Page 10 of 10" if index >= 8 else f"Page {index + 1} of 10"
+        chunks.extend(
+            _chunks(
+                title,
+                page_line,
+                page_line,
+                f"Stylo (Pvt.) Ltd. - HR Policy Manual. {page_line}.",
+                page=index + 1,
+                image_path=image,
+            )
+        )
         for item in page:
             chunks.extend(
                 _chunks(
@@ -770,10 +1005,10 @@ def _chunks(
     if not body:
         return []
     label = f"{title}, {heading}" if heading and heading != title else title
-    pieces = [body] if content_type != "section" else _split_section(body)
+    pieces = _split_section(body)
     found = []
     for piece in pieces:
-        embed = "\n".join(part for part in (title, heading_path, piece) if part)
+        embed = "\n".join(part for part in (title[:200], heading_path[:600], piece) if part)
         found.append(
             ChunkDraft(
                 section_label=label,
@@ -792,28 +1027,28 @@ def _chunks(
 
 def _split_section(text: str) -> list[str]:
     text = text.strip()
-    if len(text) <= CHUNK_CHARS:
+    if len(text.encode("utf-8")) <= CHUNK_CHARS:
         return [text]
-    if CHUNK_OVERLAP >= CHUNK_CHARS:
+    if CHUNK_CHARS <= 0 or not 0 <= CHUNK_OVERLAP < CHUNK_CHARS:
         raise RuntimeError("Overlap must be smaller than the passage size.")
     units = _units(text)
     chunks: list[str] = []
     current = ""
     for unit in units:
-        if len(unit) > CHUNK_CHARS:
+        if len(unit.encode("utf-8")) > CHUNK_CHARS:
             if current:
                 chunks.append(current)
                 current = ""
             chunks.extend(_word_windows(unit))
             continue
         candidate = f"{current}\n{unit}".strip() if current else unit
-        if len(candidate) <= CHUNK_CHARS:
+        if len(candidate.encode("utf-8")) <= CHUNK_CHARS:
             current = candidate
             continue
         chunks.append(current)
         tail = _overlap_tail(current)
         current = f"{tail}\n{unit}".strip() if tail else unit
-        if len(current) > CHUNK_CHARS:
+        if len(current.encode("utf-8")) > CHUNK_CHARS:
             current = unit
     if current:
         chunks.append(current)
@@ -826,7 +1061,7 @@ def _units(text: str) -> list[str]:
         paragraphs = [part.strip() for part in text.splitlines() if part.strip()]
     units: list[str] = []
     for paragraph in paragraphs:
-        if len(paragraph) <= CHUNK_CHARS:
+        if len(paragraph.encode("utf-8")) <= CHUNK_CHARS:
             units.append(paragraph)
             continue
         buffer = ""
@@ -835,7 +1070,7 @@ def _units(text: str) -> list[str]:
             if not sentence:
                 continue
             candidate = f"{buffer} {sentence}".strip() if buffer else sentence
-            if buffer and len(candidate) > CHUNK_CHARS:
+            if buffer and len(candidate.encode("utf-8")) > CHUNK_CHARS:
                 units.append(buffer)
                 buffer = sentence
             else:
@@ -846,14 +1081,30 @@ def _units(text: str) -> list[str]:
 
 
 def _word_windows(text: str) -> list[str]:
-    words = text.split()
     chunks: list[str] = []
     current: list[str] = []
-    for word in words:
+    for word in text.split():
+        if len(word.encode("utf-8")) > CHUNK_CHARS:
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+            fragment = ""
+            size = 0
+            for character in word:
+                width = len(character.encode("utf-8"))
+                if size + width > CHUNK_CHARS:
+                    chunks.append(fragment)
+                    fragment, size = "", 0
+                fragment += character
+                size += width
+            current = [fragment]
+            continue
         candidate = " ".join([*current, word])
-        if current and len(candidate) > CHUNK_CHARS:
+        if current and len(candidate.encode("utf-8")) > CHUNK_CHARS:
             chunks.append(" ".join(current))
             current = _overlap_words(current)
+            while current and len(" ".join([*current, word]).encode("utf-8")) > CHUNK_CHARS:
+                current = current[1:]
         current.append(word)
     if current:
         chunks.append(" ".join(current))
@@ -861,7 +1112,9 @@ def _word_windows(text: str) -> list[str]:
 
 
 def _overlap_tail(text: str) -> str:
-    tail = text[-CHUNK_OVERLAP:]
+    if not CHUNK_OVERLAP:
+        return ""
+    tail = text.encode("utf-8")[-CHUNK_OVERLAP:].decode("utf-8", errors="ignore")
     space = tail.find(" ")
     if space != -1:
         tail = tail[space + 1 :]
@@ -872,7 +1125,7 @@ def _overlap_words(words: list[str]) -> list[str]:
     kept: list[str] = []
     used = 0
     for word in reversed(words):
-        extra = len(word) + (1 if kept else 0)
+        extra = len(word.encode("utf-8")) + (1 if kept else 0)
         if used + extra > CHUNK_OVERLAP:
             break
         kept.append(word)
@@ -906,9 +1159,11 @@ _TRAVEL_PAGES: list[list[dict]] = [
         {
             "heading": "Travel Policy",
             "body": (
-                "Stylo (Pvt.) Ltd. HR Policy Manual. Travel Policy. Code Rev 00. "
-                "Approved by Zainab Khan, Head HR, and Huzaifa Siddiqui, COO. "
-                "Effective date of policy: April 15, 2025."
+                "Stylo (Pvt.) Ltd. - HR Policy Manual. TRAVEL POLICY. Code: Rev: 00. "
+                "Approved By: Zainab Khan, Head HR, and Huzaifa Siddiqui, COO. "
+                "Name of Official Person: Zainab Khan and Huzaifa Siddiqui. "
+                "Designation: Head HR and COO. Date of Signature: 14/4/25. "
+                "Effective Date of Policy: April 15, 2025."
             ),
         },
         {
@@ -931,23 +1186,36 @@ _TRAVEL_PAGES: list[list[dict]] = [
         {
             "heading": "3.1. Bookings and Record Keeping",
             "body": (
-                "All travel bookings will be made through the Administration Department. "
-                "The Administration Department negotiates with hotels and travel agencies, keeps the hotel star listing, "
-                "and informs Human Resource when it changes. It maintains travel records, notifies the employee when "
-                "arrangements are confirmed, and checks that the bill matches the services received."
+                "3.1.1. All Travel bookings will be made through the Administration Department.\n"
+                "3.1.2. The Administration Department is responsible for negotiating and managing relationships "
+                "with hotels, travel agencies, and other travel-related vendors.\n"
+                "3.1.3. The Administration Department will be responsible for keeping an updated hotel star "
+                "listing & inform Human Resource (HR) Department in case there is any change.\n"
+                "3.1.4. The Administration Department will be responsible for maintaining the travel records of "
+                "all employees.\n"
+                "3.1.5. Notify the employee once travel and accommodation arrangements are confirmed and "
+                "provide them with all relevant documents.\n"
+                "3.1.6. The Administration Department should verify and approve the accuracy and completeness "
+                "of the bill, ensuring it matches the services or goods received from the vendor."
             ),
         },
     ],
     [
         {
+            "heading": "3.1. Bookings and Record Keeping",
+            "body": (
+                "3.1.7. The Finance Department will ensure the bill is processed as per agreed timelines with "
+                "Administration Department on receiving the bill."
+            ),
+        },
+        {
             "heading": "3.2. Authorization of Travel",
             "body": (
-                "All business travel must be pre-approved by the competent authority. "
-                "A signed Travel Request Form (Annexure A) must be submitted to the Administration Department via HR "
-                "at least 7 days prior to the travel date. For urgent travel, approval may be by email, and the form "
-                "is completed on return. "
-                "For Sales Staff, they will follow the internal guidelines already in place for Sales & Operation Department. "
-                "For Field Audit Staff, they will follow the internal guidelines already in place for Audit Department."
+                "3.2.1. All business travel must be pre-approved by the competent authority as stated in the table below:\n"
+                "3.2.2. A dually signed Travel Request Form (please refer to Annexure A) must be submitted to the Administration Department via HR Department at least 7 days prior to the travel date.\n"
+                "3.2.3. In the event of an urgent travel requirement, the employee must seek approval via email from the relevant authority. Upon returning, the employee will complete the Travel Request Form and obtain all necessary approvals.\n"
+                "3.2.4. For Sales Staff, they will follow the internal guidelines already in place for Sales & Operation Department.\n"
+                "3.2.5. For Field Audit Staff, they will follow the internal guidelines already in place for Audit Department."
             ),
         },
         {
@@ -964,6 +1232,14 @@ _TRAVEL_PAGES: list[list[dict]] = [
             "heading": "3.2. Authorization of Travel",
             "kind": "table",
             "body": "Grade: Manager, Assistant Manager, Senior Executive, Executive, Officer and below. Competent Authority: Head of Department.",
+        },
+        {
+            "heading": "4. Mode of Travel",
+            "body": (
+                "4.1. The Administration Department will be responsible for selecting an appropriate mode of travel, "
+                "depending on distance, travel time cost effectiveness and safety. Please refer to the following "
+                "entitlements table for travelling within the country:"
+            ),
         },
         {
             "heading": "4. Mode of Travel",
@@ -1005,48 +1281,85 @@ _TRAVEL_PAGES: list[list[dict]] = [
             "heading": "4. Mode of Travel",
             "kind": "table",
             "body": (
-                "Grade: Senior Executive (SE) & below. Travel by air: none. "
+                "Grade: Senior Executive (SE) & below. Travel by air: -. "
                 "Travel by rail: A/C-Standard/Lower. Travel by road: A/C Bus."
             ),
         },
         {
-            "heading": "4.3. Air travel",
+            "heading": "4. Mode of Travel",
             "body": (
-                "Carrier choice in the case of air travel will be determined by the Administration Department based on cost and travel time. "
-                "Female employees not eligible for air travel based on their grade will follow the travel policy applicable "
-                "to the lowest grade with air travel entitlement."
+                "4.2. Carrier choice in the case of air travel will be determined by the Administration Department "
+                "based on cost and travel time.\n"
+                "4.3. Female employees not eligible for air travel based on their grade will follow the travel policy "
+                "applicable to the lowest grade with air travel entitlement."
             ),
             "polarity": "exclusion",
         },
         {
-            "heading": "4.4. Company vehicle and fuel",
+            "heading": "4.4. Travel for Employees with Company-Maintained Vehicles (Car/Motorbike) or Vehicle Allowance",
             "body": (
-                "Employees using a company-maintained vehicle, or those with a vehicle allowance, are reimbursed for fuel "
-                "at the mileage rate in Annexure D, plus actual toll charges with receipts. "
-                "Personal vehicles need prior approval and are generally discouraged. Fuel is reimbursed at the same mileage rate, plus tolls with receipts."
+                "4.4.1. Employees using a company-maintained vehicle for business travel, or those with a vehicle "
+                "allowance, will be reimbursed for fuel expenses based on the mileage rate outlined in the Annexure D. "
+                "Additionally, employees will be reimbursed for any actual toll charges incurred during business travel, "
+                "provided that receipts and proper documentation are submitted."
+            ),
+        },
+        {
+            "heading": "4.5. Travel by Personal Vehicle (Car/Motorbike)",
+            "body": (
+                "4.5.1.1. Employees are required to obtain prior approval from the relevant authority before using "
+                "personal vehicles for company business. However, the use of personal transport is generally discouraged, "
+                "where company-provided transport (such as company-maintained vehicles) is available to the employee. "
+                "If personal vehicles are used for business travel with prior approval, employees are eligible for "
+                "reimbursement of fuel expenses at the same mileage rate specified in the Vehicle Policy for category "
+                "mentioned in point 4.4. Additionally, employees will be reimbursed for any actual toll charges incurred "
+                "during business travel, provided that receipts and proper documentation are submitted.\n"
+                "4.5.1.2. Employees who are not eligible for company-maintained vehicles or vehicle allowance, are "
+                "eligible for reimbursement of fuel expenses at the same mileage rate specified in the Vehicle Policy. "
+                "Additionally, employees will be reimbursed for any actual toll charges incurred during business travel, "
+                "provided that receipts and proper documentation are submitted."
             ),
         },
     ],
     [
         {
-            "heading": "4.5.2. Taxi and rent-a-car",
+            "heading": "4.5.2. Travel by Taxi/Rent-a-car",
             "body": (
-                "Taxi and rent-a-car charges are reimbursed on actual for all grades when that mode is required, against actual bills. "
-                "Intra-city taxi charges during travelling are reimbursed on actual against bills."
+                "4.5.2.1. Tax/Rent-a-car charges will be reimbursed on actual for all grades if the employee "
+                "is required to use this mode of transport for business travel. The employee will be required to "
+                "submit actual bills.\n"
+                "4.5.2.2. Taxi/ Rent-a-car charges will be reimbursed on actual for intra-city business travel "
+                "during travelling upon submission of actual bills."
             ),
         },
         {
             "heading": "5. Accommodation",
             "body": (
-                "Employees are eligible for company-provided hotels or guest rooms as per the entitlement table. "
-                "Every grade's hotel entitlement is Annexure C. "
-                "Administration decides the stay and negotiates corporate rates. "
-                "Accommodation is single occupancy. Double occupancy is paid by the employee for the difference, in cash. "
-                "A stay above entitlement needs approval from the relevant authority and HR, and the employee pays the difference. "
-                "Travelling with a supervisor may use the supervisor's hotel with HR approval. "
-                "Peer-group travel uses twin sharing at the employee's entitlement. "
-                "If the entitled hotel is unavailable, a higher grade may be approved by the relevant authority and HR. "
-                "Where hotels are unavailable, a rest house or circuit house of the same category may be used, claimed on the Travel Expense Form (Annexure B)."
+                "5.1. Employees will be eligible for accommodation in company-provided hotels or guest rooms, based "
+                "on the entitlement levels outlined in the table below:\n"
+                "Grade: COO (Business) / Group Chief (GC). Hotel Entitlement: Annexure C.\n"
+                "Grade: Deputy General Manager (DGM) to General Manager (GM). Hotel Entitlement: Annexure C.\n"
+                "Grade: Assistant General Manager (AGM) & Senior Manager (SM). Hotel Entitlement: Annexure C.\n"
+                "Grade: Manager (M) & Assistant Manager (AM). Hotel Entitlement: Annexure C.\n"
+                "Grade: Senior Executive (SE) & below. Hotel Entitlement: Annexure C.\n"
+                "5.2. The booking request will be given to the Administration Department who will decide about the "
+                "stay as per entitlement and company interest. The Administration Department will negotiate corporate "
+                "rates with hotels for accommodation.\n"
+                "5.3. Accommodation will be provided on a single-occupancy basis. If an employee opts for double "
+                "occupancy, he/she will be responsible for covering the difference in cost, which must be paid in cash.\n"
+                "5.4. Employees wishing to stay in accommodation above their entitlement shall be allowed by the "
+                "relevant authority and the HR Department, provided that the concerned employee pays the differential amount.\n"
+                "5.5. If an employee is traveling with their supervisor for a meeting, they may stay at the same hotel "
+                "as their supervisor, subject to prior approval from the HR Department.\n"
+                "5.6. If an employee is travelling with their peer group for a visit/meeting, they must stay at the same "
+                "hotel, they would be required to stay in twin sharing as per their hotel entitlement.\n"
+                "5.7. If the entitled accommodation is unavailable, the employee may be accommodated in a higher-grade "
+                "facility with prior approval from the relevant authority and the HR Department.\n"
+                "5.8. In small towns or rural areas where hotels are unavailable, employees may arrange accommodation "
+                "in a rest house or circuit house, provided it is equivalent to or below their entitled hotel category "
+                "for overnight stays while on company business. Reimbursement can be claimed by submitting a Travel "
+                "Expense Form (Please refer to Annexure B) to the HR Department for verification. The HR Department "
+                "will forward the form to Finance Department for further action."
             ),
         },
     ],
@@ -1054,53 +1367,61 @@ _TRAVEL_PAGES: list[list[dict]] = [
         {
             "heading": "5. Accommodation",
             "body": (
-                "Female employees traveling within Pakistan, regardless of their entitlement, are permitted to stay at a secure hotel, "
-                "including five-star hotels, when necessary. Hotel expenses other than room rent include breakfast only. "
-                "For departmental training or conferences, all employees stay at the same hotel, approved by the Head of Department."
+                "5.9. Female employees traveling within Pakistan, regardless of their entitlement, are permitted to "
+                "stay at a secure hotel, including five-star hotels, when necessary.\n"
+                "5.10. Hotel expenses other than room rent include breakfast only.\n"
+                "5.11. For departmental training or conferences, all employees are required to stay at the same "
+                "hotel, with the Head of Department responsible for approving the accommodation."
             ),
         },
         {
             "heading": "6. Daily Allowance",
             "body": (
-                "Daily Allowance is inclusive of all out-of-pocket expenses like meals, tips, laundry, and other incidental expenses. "
-                "This amount is exclusive of guest room, hotel rents and taxi fare. "
-                "A daily allowance is granted for business travel of 300 km or more round trip from the permanent place of work. "
-                "One full DA applies when the absence lasts a full calendar day or exceeds 12 hours. "
-                "Half DA is granted for same-day return trips of 12 hours or less. "
-                "For training that provides breakfast and lunch, half DA covers dinner. If the travel is fully sponsored, no DA is granted. "
-                "Daily allowance is granted for weekends and public holidays during the trip."
+                "Daily Allowance is inclusive of all out-of-pocket expenses like meals, tips, laundry, and other incidental "
+                "expenses. This amount is exclusive of guest room, hotel rents and taxi fare.\n"
+                "6.1. A daily allowance will be granted for business travel originating from the permanent place of "
+                "work, applicable for journeys totaling 300 km or more (round trip), including transit time.\n"
+                "6.2. One full DA is applicable for a business-related absence from the permanent place of work that "
+                "lasts for a full calendar day or exceeds 12 hours.\n"
+                "6.3. Half DA is granted for same-day return trips if the work-related travel is 12 hours or less.\n"
+                "6.4. For training or sponsored travel that provides breakfast and lunch, half DA will be provided to "
+                "cover dinner and any additional out-of-pocket expenses. If the travel is fully sponsored, no DA "
+                "will be granted.\n"
+                "6.5. A daily allowance will be granted for weekends and public holidays that occur during the business trip.\n"
+                "6.6. The daily allowance rates are as follows:"
             ),
         },
         {
             "heading": "6. Daily Allowance",
             "kind": "table",
-            "body": "Grade: COO (Business) / Group Chief (GC). Daily Allowance per day: 2,000 rupees.",
+            "body": "Grade: COO (Business) / Group Chief (GC). Daily Allowance/per day (given in rupees): 2,000.",
         },
         {
             "heading": "6. Daily Allowance",
             "kind": "table",
-            "body": "Grade: Deputy General Manager (DGM) to General Manager (GM). Daily Allowance per day: 1,800 rupees.",
+            "body": "Grade: Deputy General Manager (DGM) to General Manager (GM). Daily Allowance/per day (given in rupees): 1,800.",
         },
         {
             "heading": "6. Daily Allowance",
             "kind": "table",
-            "body": "Grade: Assistant General Manager (AGM) & Senior Manager (SM). Daily Allowance per day: 1,600 rupees.",
+            "body": "Grade: Assistant General Manager (AGM) & Senior Manager (SM). Daily Allowance/per day (given in rupees): 1,600.",
         },
         {
             "heading": "6. Daily Allowance",
             "kind": "table",
-            "body": "Grade: Assistant Manager (AM) & Manager (M). Daily Allowance per day: 1,500 rupees.",
+            "body": "Grade: Assistant Manager (AM) & Manager (M). Daily Allowance/per day (given in rupees): 1,500.",
         },
         {
             "heading": "6. Daily Allowance",
             "kind": "table",
-            "body": "Grade: Senior Executive (SE) & below. Daily Allowance per day: 1,200 rupees.",
+            "body": "Grade: Senior Executive (SE) & below. Daily Allowance/per day (given in rupees): 1,200.",
         },
         {
             "heading": "7. Daily Tour Allowance for Field-Based Employees",
             "body": (
-                "Daily Tour allowance for a same-day return is admissible when the employee travels 25 kilometers or above one way "
-                "from the base town to any other town."
+                "7.1. Daily Tour allowance (same day return) shall be admissible if employee travels from his base "
+                "town to any other town (same day return) 25 Kilometers or above (one way).\n"
+                "7.2. Daily Tour allowance shall be given as per following rates:"
             ),
         },
     ],
@@ -1118,39 +1439,46 @@ _TRAVEL_PAGES: list[list[dict]] = [
         {
             "heading": "8. Travel Expense Form",
             "body": (
-                "Employees must complete the Travel Expense Form (Annexure B) and submit it to Finance with original bills "
-                "within 7 days of returning. Prior approval is required. Expenses above entitlement need approval. "
-                "Any excess advance is returned or deducted."
+                "8.1. Employees must complete the Travel Expense Form (Please see Annexure B) for any reimbursements "
+                "and settlement of expenses, and submit it to the Finance Department, along with all original bills "
+                "and receipts, within 7 days of returning from business travel. Prior approval from the relevant "
+                "authority is required before submission.\n"
+                "8.2. Any expenses exceeding the specified entitlements must be approved by the relevant authority.\n"
+                "8.3. In the case of advance payments, the employee is responsible for returning any excess amount, "
+                "or it will be deducted from their account."
             ),
         },
         {
             "heading": "9. Travel of Family Members",
             "body": (
-                "An employee who wishes to travel with family members may do so at their own expense. "
-                "The company will not bear travel and other related expenses such as accommodation and meals."
+                "9.1. An employee who wishes to travel with family members may do so at their own expense. The "
+                "company will not be liable to bear travel and other related expenses (accommodation, meals etc.)."
             ),
             "polarity": "exclusion",
         },
         {
             "heading": "10. Cancellations and Missed Flights",
-            "body": "If a business trip is cancelled, the employee must promptly notify the Administration Department.",
+            "body": (
+                "10.1. In the event of a business trip cancellation, employees must promptly notify the "
+                "Administration Department to prevent any unnecessary penalties."
+            ),
         },
         {
             "heading": "11. Policy Renewal and Review",
             "body": (
                 "11.1. The Travel Policy will undergo a comprehensive review every two years, or sooner if required, "
                 "to ensure it remains aligned with organizational needs and industry best practices. "
-                "Any necessary adjustments will be implemented to reflect changes in business priorities or operational requirements. "
+                "Any necessary adjustments will be implemented to reflect changes in business priorities, or operational requirements. "
                 "11.2. Employees will be informed of any changes to the policy during the renewal period."
             ),
         },
         {
             "heading": "12. Policy Attachments",
             "body": (
-                "Travel Request Form, Annexure A. "
-                "Travel Expense Form, Annexure B. "
-                "Hotel Entitlement List, Annexure C. "
-                "Fuel Entitlement List, Annexure D."
+                "Travel Request Form- Annexure A.\n"
+                "Travel Expense Form-Annexure B.\n"
+                "Hotel Entitlement List-Annexure C.\n"
+                "Fuel Entitlement List-Annexure D."
             ),
         },
         {
@@ -1166,13 +1494,19 @@ _TRAVEL_PAGES: list[list[dict]] = [
             "heading": "Annexure A: Travel Request Form",
             "kind": "form",
             "body": (
-                "Annexure A: Travel Request Form: https://home.ssis.pk/travel-request-form. Form reference TRF-2025-04-16/01. "
-                "Employee information: full name, department, employee ID, job title, base station, contact number, "
-                "type of travel overnight or same day, number of nights. "
-                "Passengers: employee ID, name, job title, department, same day, number of nights. "
-                "Purpose of travel. Travel start date, travel end date, time of departure, from city, to city, mode of travel, travel class. "
-                "Hotel stay requested, self accommodation, or no stay required. Advance required. Additional comments. "
-                "Employee signature, date of submission, competent authority signature."
+                "Annexures. Annexure A: Travel Request Form: https://home.ssis.pk/travel-request-form. "
+                "Travel Request Form. Form Reference: TRF-2025-04-16/01.\n"
+                "Employee Information: Full Name, Department, Employee ID, Job Title, Base Station, Contact No, "
+                "Type of Travel (Overnight / Same Day), No. of Nights in case of Overnight Stay.\n"
+                "No. of Passengers (Please fill this section if there are more than 1 passengers): "
+                "Employee ID, Name, Job Title, Department, Same Day, No. of Nights.\n"
+                "Purpose of Travel (Please be specific).\n"
+                "Travel Details: Travel Start Date, Travel End Date, Date of Travel, Time of Departure, "
+                "From (City), To (City), Mode of Travel, Travel Class.\n"
+                "Accommodation Details: Hotel Stay Requested, Self Accommodation, No Stay Required.\n"
+                "Advance Details: Advance Required.\n"
+                "Additional Comments (If Any).\n"
+                "Authorization: Employee's Signature, Date of Submission, Competent Authority Signature."
             ),
         }
     ],
@@ -1182,60 +1516,64 @@ _TRAVEL_PAGES: list[list[dict]] = [
             "kind": "form",
             "body": (
                 "Annexure B: Travel Expense Form: https://home.ssis.pk/travel-claim-form. "
-                "Travel claim form. Form reference TCF-2025-04-9. "
-                "Name, employee code, designation, department. "
-                "Start date, start time, end date, end time, same day, travel type, days travel, nights stay. "
-                "Visit details and additional remarks. "
-                "Expenses: description, amount in Rs, notes. Rate per KM, total KM, toll plaza, ticket charges, local travel, meals, "
-                "hotel bill, self stay, board or meeting room charges, total expenses. "
-                "Traveller signature and HOD or director signature."
+                "TRAVEL CLAIM FORM. Form Reference: TCF-2025-04-9.\n"
+                "Employee Details: Name, Employee Code, Designation, Department.\n"
+                "Travel Details: Start Date, Start Time, End Date, End Time, Same Day, Travel Type, "
+                "Days Travel, Nights Stay, Visit Details, Additional Remarks.\n"
+                "Expenses Details: Description, Amount (Rs), Notes.\n"
+                "Rate per KM. Total KM. Toll Plaza (if out of city): Receipt required. "
+                "Ticket Charges (if local traveling): Receipt required. "
+                "Local Travel: No receipt required for local travel. Meals. "
+                "Hotel Bill (if not BTC). Self Stay: No receipt required. "
+                "Board/Meeting Room Charges. Total Expenses.\n"
+                "Traveller Signature. HOD/Director."
             ),
         }
     ],
     [
         {
-            "heading": "Annexure C: Hotel Entitlement",
+            "heading": "Annexure C",
             "kind": "table",
             "body": (
-                "Grade: Group Chief (GC). Hotel entitlement: Avari Towers, Pearl Continental, Marriott Hotel, Movenpick Hotel, "
+                "Annexure C. Grade: Group Chief (GC). Hotel Entitlement: Avari Towers, Pearl Continental, Marriott Hotel, Movenpick Hotel, "
                 "Ramada Creek Hotel, Nishat Hotel, Faletti's Hotel, Serena Hotel. "
-                "Proposed rates: PKR 28,000 to PKR 35,000. Self-stay: PKR 22,000. "
-                "All applicable taxes shall be treated separately from the above limits."
+                "Proposed Rates: PKR 28,000 – PKR 35,000. Self-Stay: PKR 22,000/-. "
+                "*All applicable taxes shall be treated separately from the above limits."
             ),
         },
         {
-            "heading": "Annexure C: Hotel Entitlement",
+            "heading": "Annexure C",
             "kind": "table",
             "body": (
                 "Grade: Deputy General Manager (DGM) to General Manager (GM). "
-                "Hotel entitlement: Nishat Hotel, Royal Swiss, Luxus Grand, Best Western Premier, Avari Express. "
-                "Proposed rates: PKR 24,000 to PKR 28,000. Self-stay: PKR 15,500."
+                "Hotel Entitlement: Nishat Hotel, Royal Swiss, Luxus Grand, Best Western Premier, Avari Express. "
+                "Proposed Rates: PKR 24,000 – PKR 28,000. Self-Stay: PKR 15,500/-."
             ),
         },
         {
-            "heading": "Annexure C: Hotel Entitlement",
+            "heading": "Annexure C",
             "kind": "table",
             "body": (
                 "Grade: Assistant General Manager (AGM) & Senior Manager (SM). "
-                "Hotel entitlement: Challet Hotel, Hotel One, Hotel Excelsior. "
-                "Proposed rates: PKR 20,000 to PKR 24,000. Self-stay: PKR 13,000."
+                "Hotel Entitlement: Challet Hotel, Hotel One, Hotel Excelsior. "
+                "Proposed Rates: PKR 20,000 – PKR 24,000. Self-Stay: PKR 13,000/-."
             ),
         },
         {
-            "heading": "Annexure C: Hotel Entitlement",
+            "heading": "Annexure C",
             "kind": "table",
             "body": (
                 "Grade: Assistant Manager (AM) & Manager (M). "
-                "Hotel entitlement: Faran Hotel, Asaish Hotel or as per available list of hotels. "
-                "Proposed rates: PKR 12,000 to PKR 16,000. Self-stay: PKR 8,000."
+                "Hotel Entitlement: Faran Hotel, Asaish Hotel or as per available list of Hotels. "
+                "Proposed Rates: PKR 12,000 – PKR 16,000. Self-Stay: PKR 8,000/-."
             ),
         },
         {
-            "heading": "Annexure C: Hotel Entitlement",
+            "heading": "Annexure C",
             "kind": "table",
             "body": (
-                "Grade: Senior Executive (SE) & below. Hotel entitlement: twin sharing as per the available list of hotels. "
-                "Proposed rates: none. Self-stay: PKR 5,000."
+                "Grade: Senior Executive (SE) & Below. Hotel Entitlement: Twin Sharing (as per available list of hotels). "
+                "Proposed Rates: -. Self-Stay: PKR 5,000/-."
             ),
         },
     ],
@@ -1243,37 +1581,37 @@ _TRAVEL_PAGES: list[list[dict]] = [
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 70cc petrol. Grade entitlement: all levels. Mileage: 40 km/liter. Maintenance and depreciation: Rs 2.0/km.",
+            "body": "Sr. #: 1. Vehicle type: 70cc petrol. Grade entitlement: All Levels. Mileage (KM Coverage): 40 km/liter. Maintenance and depreciation (New Rates): Rs. 2.0/km.",
         },
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 125cc petrol. Grade entitlement: all levels. Mileage: 30 km/liter. Maintenance and depreciation: Rs 2.5/km.",
+            "body": "Sr. #: 2. Vehicle type: 125cc petrol. Grade entitlement: All Levels. Mileage (KM Coverage): 30 km/liter. Maintenance and depreciation (New Rates): Rs. 2.5/km.",
         },
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 660cc/800cc petrol. Grade entitlement: O to M. Mileage: 14 km/liter. Maintenance and depreciation: Rs 3.5/km.",
+            "body": "Sr. #: 3. Vehicle type: 660cc/800cc petrol. Grade entitlement: O to M. Mileage (KM Coverage): 14 km/liter. Maintenance and depreciation (New Rates): Rs. 3.5/km.",
         },
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 1000cc petrol. Grade entitlement: SM / AGM. Mileage: 12 km/liter. Maintenance and depreciation: Rs 3.5/km.",
+            "body": "Sr. #: 4. Vehicle type: 1000cc petrol. Grade entitlement: SM / AGM. Mileage (KM Coverage): 12 km/liter. Maintenance and depreciation (New Rates): Rs. 3.5/km.",
         },
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 1300cc petrol. Grade entitlement: DGM / GM. Mileage: 10 km/liter. Maintenance and depreciation: Rs 4.0/km.",
+            "body": "Sr. #: 5. Vehicle type: 1300cc petrol. Grade entitlement: DGM / GM. Mileage (KM Coverage): 10 km/liter. Maintenance and depreciation (New Rates): Rs. 4.0/km.",
         },
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 1500cc petrol. Grade entitlement: GM / GC. Mileage: 10 km/liter. Maintenance and depreciation: Rs 5.0/km.",
+            "body": "Sr. #: 6. Vehicle type: 1500cc petrol. Grade entitlement: GM / GC. Mileage (KM Coverage): 10 km/liter. Maintenance and depreciation (New Rates): Rs. 5.0/km.",
         },
         {
             "heading": "Annexure D: Fuel Entitlement List",
             "kind": "table",
-            "body": "Vehicle: 1800cc petrol. Grade entitlement: GC / COO (Business). Mileage: 10 km/liter. Maintenance and depreciation: Rs 6.0/km.",
+            "body": "Sr. #: 7. Vehicle type: 1800cc petrol. Grade entitlement: GC / COO (Business). Mileage (KM Coverage): 10 km/liter. Maintenance and depreciation (New Rates): Rs. 6.0/km.",
         },
     ],
 ]

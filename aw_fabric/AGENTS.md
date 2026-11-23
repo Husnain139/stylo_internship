@@ -75,7 +75,7 @@ V-Order on. No partitioning, Z-order, or liquid clustering.
 
 `dbo.usp_Load_Gold` is one transaction. Keys are declared `NOT ENFORCED`. Unknown member is `-1`.
 
-`FactSales` is one row per order line. `NetPrice = UnitPrice * Qty * (1 - UnitPriceDiscount)`. `UnitPriceDiscount` is a rate. Total sales is `NetPrice`. `Tax` and `Freight` are allocated by the line's share of header `SubTotal`. A zero subtotal keeps both amounts on the first line. `StandardCost` is `ProductCostHistory` as of `OrderDate`, else `Product.StandardCost`.
+`FactSales` is one row per order line. `GrossSalesAmount = UnitPrice * Qty`. `DiscountAmount = GrossSalesAmount * UnitPriceDiscount`; the discount is a rate. `LineNetSalesAmount = GrossSalesAmount - DiscountAmount`, and the total-sales measure is `SUM(LineNetSalesAmount)`. `AllocatedTaxAmount` and `AllocatedFreightAmount` are allocated by the line's share of header `SubTotal`. `LineTotalDueAmount = LineNetSalesAmount + AllocatedTaxAmount + AllocatedFreightAmount`. `UnitStandardCost` is `ProductCostHistory` as of `OrderDate`, else `Product.StandardCost`; `LineCostAmount = UnitStandardCost * Qty`; `ProfitAmount = LineNetSalesAmount - LineCostAmount`. A zero subtotal keeps both allocations on the first line.
 
 `DimCustomer` is a person. `DimStore` is a store. Store-only lines use customer `-1`. Person-only lines use store `-1`.
 

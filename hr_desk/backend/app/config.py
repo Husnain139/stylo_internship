@@ -5,10 +5,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 DESK_ROOT = BACKEND_ROOT.parent
+load_dotenv(DESK_ROOT / ".env")
+DATA_ROOT = Path(os.environ.get("HR_DESK_DATA_ROOT", BACKEND_ROOT / "data")).resolve()
 
 MAX_USER_CHARS = 1000
+SESSION_HOURS = 12
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024 #64MB
+LOGIN_LIMIT = 8
+LOGIN_WINDOW_S = 15 * 60
+ASK_LIMIT = 20
+ASK_WINDOW_S = 15 * 60
 CLASSIFIER_MAX_TOKENS = 30
 REWRITE_MAX_TOKENS = 120
 ANSWER_MAX_TOKENS_NANO = 400
@@ -18,7 +28,19 @@ TEMPERATURE_CLASSIFIER = 0.0
 TIMEOUT_CLASSIFIER_S = 8.0
 TIMEOUT_ANSWER_S = 20.0
 TIMEOUT_MODERATION_S = 8.0
-CACHE_SIMILARITY = 0.92
+CACHE_TTL_MINUTES = 60
+CACHE_MAX_ROWS = 1000
+CHAT_RETENTION_DAYS = 30
+CHAT_MAX_MESSAGES = 40
+CHAT_CONTEXT_BYTES = 1000
+ASK_DEADLINE_S = 35
+TEAM_ASK_LIMIT = 120
+TEAM_ASK_WINDOW_S = 15 * 60
+TEAM_DAILY_ASK_LIMIT = 600
+TEAM_CONCURRENCY = 4
+CHUNK_CHARS = 3200
+CHUNK_OVERLAP = 400
+EVIDENCE_MAX_BYTES = 12000
 RETRIEVE_TOP_K = 6
 RETRIEVE_CANDIDATES = 20
 MIN_VECTOR_SCORE = 0.25
@@ -29,7 +51,6 @@ MAX_PASSAGES = 4
 CANARY = "STYLO-PROMPT-DO-NOT-REPEAT"
 
 REFUSAL = "I can't answer that."
-ROLE_REFUSAL = "I can't answer that. Your role doesn't include this."
 UNKNOWN = "I couldn't find this in the policies I can open. Ask HR."
 TOO_LONG = "Please ask a shorter question."
 EMPTY_QUESTION = "Type a question first."

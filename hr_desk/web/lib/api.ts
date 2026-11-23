@@ -1,12 +1,3 @@
-export class ApiError extends Error {
-  status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.status = status;
-  }
-}
-
 export type Person = {
   email: string;
   name: string;
@@ -35,6 +26,48 @@ export type PolicyRow = {
   starts_on: string;
   ends_on?: string | null;
   filename?: string;
+  canRollback?: boolean;
+  status: "Active" | "Scheduled" | "Expired" | "Replaced";
+  replacementStartsOn?: string | null;
+};
+
+export type PolicyJob = {
+  id: string;
+  kind: "prepare" | "publish";
+  status: "queued" | "running" | "completed" | "failed";
+  title: string;
+  detail: string;
+  draftId?: string | null;
+};
+
+export type PolicyDraft = {
+  id: string;
+  title: string;
+  filename: string;
+  audience: string;
+  startsOn: string;
+  endsOn: string | null;
+  replaces: string | null;
+  hasSourceFile: boolean;
+  warnings: string[];
+  passages: { heading: string; type: string; page: number | null; text: string; gradeRoles: string[] }[];
+};
+
+export type EmployeeRow = {
+  email: string;
+  name: string;
+  designation: string;
+  role: string;
+  isAdmin: boolean;
+  hasPassword: boolean;
+};
+
+export type AdminAction = {
+  id: string;
+  action: string;
+  detail: string;
+  who: string;
+  when: string;
 };
 
 export type QuestionRow = {
@@ -70,12 +103,18 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, { ...init, headers });
-  } catch {
-    throw new ApiError("The assistant is not available right now. Try again in a moment.", 0);
+  } catch (caught) {
+    if (caught instanceof Error && caught.name === "AbortError") throw caught;
+    throw new Error("The assistant is not available right now. Try again in a moment.");
   }
   const data = (await response.json().catch(() => ({}))) as { message?: string };
   if (!response.ok) {
-    throw new ApiError(data.message || "Something went wrong. Try again.", response.status);
+    const seconds = Number(response.headers.get("Retry-After"));
+    if (response.status === 429 && seconds > 0) {
+      const wait = seconds < 60 ? `${seconds} seconds` : `${Math.ceil(seconds / 60)} minutes`;
+      throw new Error(`Too many requests. Try again in ${wait}.`);
+    }
+    throw new Error(data.message || "Something went wrong. Try again.");
   }
   return data as T;
 }

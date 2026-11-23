@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,12 +55,15 @@ def run_deterministic() -> list[Check]:
 
 
 def run_live() -> list[Check]:
+    email = os.environ.get("HR_DESK_EVAL_EMPLOYEE_EMAIL", "").strip().lower()
+    if not email:
+        raise RuntimeError("Set HR_DESK_EVAL_EMPLOYEE_EMAIL to an account with access to the summary report.")
     pipeline = build_pipeline()
     case = {
         "id": "live_summary",
         "name": "A live answer about the summary report stays inside the policy",
         "primary": True,
-        "email": "ali.employee@stylo.example",
+        "email": email,
         "question": "give me details about summart report",
         "expect": {
             "outcome": "answered",
@@ -69,6 +73,32 @@ def run_live() -> list[Check]:
         },
     }
     return [_ask_case(pipeline, case)]
+
+
+def run_screen_checks() -> dict:
+    """Checks the page can run without calling the live model or reading an old file."""
+    checks = run_deterministic()
+    failed = [check for check in checks if not check.ok]
+    if failed:
+        status = "needs_fix"
+        summary = "Needs a fix. Do not rely on these answers until the check passes."
+    else:
+        status = "safe"
+        summary = "These checks passed just now."
+    return {
+        "status": status,
+        "summary": summary,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "checks": [
+            {
+                "name": check.name,
+                "ok": check.ok,
+                "primary": check.primary,
+                "developer_detail": check.developer_detail,
+            }
+            for check in checks
+        ],
+    }
 
 
 def write_last_run(checks: list[Check], *, live_skipped: bool) -> dict:
@@ -109,11 +139,11 @@ def main() -> int:
         except Exception as exc:
             checks.append(
                 Check(
-                    name="A live answer about leave stays inside the policy",
+                    name="A live answer about the summary report stays inside the policy",
                     ok=False,
                     primary=True,
                     developer_detail=str(exc),
-                    case_id="live_leave",
+                    case_id="live_summary",
                 )
             )
     payload = write_last_run(checks, live_skipped=live_skipped)

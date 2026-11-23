@@ -24,6 +24,9 @@ class PolicyDraft:
     body: str
     chunks: list["ChunkDraft"] | None = None
     source_name: str = ""
+    warnings: list[str] = field(default_factory=list)
+    previous_id: str | None = None
+    superseded_on: date | None = None
 
 
 @dataclass
@@ -58,6 +61,7 @@ class Passage:
     page: int | None = None
     image_path: str = ""
     polarity: str = ""
+    allowed_roles: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,6 @@ class Completion:
     text: str
     tokens_in: int = 0
     tokens_out: int = 0
-    model: str = ""
 
 
 @dataclass
@@ -110,3 +113,4 @@ class AskResult:
     outcome: str
     citations: list[Citation]
     trace_id: str
+    valid_until: date | None = None

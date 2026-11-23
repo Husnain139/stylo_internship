@@ -5,11 +5,13 @@ import { api, type Person } from "@/lib/api";
 
 type SessionValue = {
   loading: boolean;
+  localPasswordSetup: boolean;
   me: Person | null;
   loadError: string;
   retry: () => Promise<void>;
   signIn: (email: string, password: string) => Promise<void>;
-  signUp: (email: string, password: string) => Promise<void>;
+  setInitialPassword: (email: string, password: string) => Promise<void>;
+  activate: (token: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
 };
 
@@ -17,12 +19,14 @@ const SessionContext = createContext<SessionValue | null>(null);
 
 export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
+  const [localPasswordSetup, setLocalPasswordSetup] = useState(false);
   const [me, setMe] = useState<Person | null>(null);
   const [loadError, setLoadError] = useState("");
 
   async function refresh() {
-    const data = await api<{ me: Person | null }>("/api/bootstrap");
+    const data = await api<{ me: Person | null; localPasswordSetup: boolean }>("/api/bootstrap");
     setMe(data.me);
+    setLocalPasswordSetup(data.localPasswordSetup);
     setLoadError("");
   }
 
@@ -43,7 +47,15 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setMe(data.me);
   }
 
-  async function signUp(email: string, password: string) {
+  async function activate(token: string, password: string) {
+    const data = await api<{ me: Person }>("/api/activate", {
+      method: "POST",
+      body: JSON.stringify({ token, password }),
+    });
+    setMe(data.me);
+  }
+
+  async function setInitialPassword(email: string, password: string) {
     const data = await api<{ me: Person }>("/api/sign-up", {
       method: "POST",
       body: JSON.stringify({ email, password }),
@@ -57,7 +69,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <SessionContext.Provider value={{ loading, me, loadError, retry: refresh, signIn, signUp, signOut }}>
+    <SessionContext.Provider value={{ loading, localPasswordSetup, me, loadError, retry: refresh, signIn, setInitialPassword, activate, signOut }}>
       {children}
     </SessionContext.Provider>
   );

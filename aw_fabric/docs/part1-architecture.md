@@ -74,13 +74,14 @@ erDiagram
 
 - `Qty` = `OrderQty`
 - `UnitPriceDiscount` is a rate
-- `GrossPrice` = `UnitPrice * Qty`
-- `NetPrice` = `UnitPrice * Qty * (1 - UnitPriceDiscount)`
-- `Tax` and `Freight` are allocated by the line's share of header `SubTotal`. A zero subtotal keeps both amounts on the first line.
-- `StandardCost` is `ProductCostHistory` as of `OrderDate`, else `Product.StandardCost`
+- `GrossSalesAmount` = `UnitPrice * Qty`
+- `DiscountAmount` = `GrossSalesAmount * UnitPriceDiscount`
+- `LineNetSalesAmount` = `GrossSalesAmount - DiscountAmount`
+- `AllocatedTaxAmount` and `AllocatedFreightAmount` are allocated by the line's share of header `SubTotal`. `LineTotalDueAmount` is line net sales plus those two amounts. `UnitStandardCost` is cost on the order date, `LineCostAmount` is unit cost times quantity, and `ProfitAmount` is line net sales minus line cost. A zero subtotal keeps both allocations on the first line.
+- `UnitStandardCost` is `ProductCostHistory` as of `OrderDate`, else `Product.StandardCost`
 - `SaleDateKey` is `OrderDate`
 
-Total sales is `NetPrice`. Average selling price is `NetPrice / Qty`. Top 10 and bottom 10 products rank on `NetPrice`.
+Total sales is `SUM(LineNetSalesAmount)`. Average selling price is `SUM(LineNetSalesAmount) / SUM(Qty)`. Top 10 and bottom 10 products rank on `SUM(LineNetSalesAmount)`.
 
 `DimCustomer` is a person: account number, title, first, middle, last, suffix, one phone and its type, one email, one address, spatial location as WKT, and the customer's sales territory. Address priority is Primary, then Home, then Billing, then Shipping. Tie-break is `AddressID`.
 

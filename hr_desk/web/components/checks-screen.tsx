@@ -39,7 +39,7 @@ export function ChecksScreen() {
           <h1>Checks</h1>
           <p className="lead">Only an admin can open this page.</p>
         </header>
-        <Link href="/">Back to Ask about a policy</Link>
+        <Link href="/">Back to Ask HR</Link>
       </section>
     );
   }
@@ -52,14 +52,13 @@ export function ChecksScreen() {
     <section className="stack">
       <header className="page-head">
         <h1>Checks</h1>
-        <p className="lead">These checks show whether answers stay inside company policy.</p>
       </header>
       {error ? (
         <p className="form-error" role="alert">
           {error}
         </p>
       ) : null}
-      {!report ? <p role="status">Loading…</p> : null}
+      {!report && !error ? <p role="status">Running checks…</p> : null}
       {report ? (
         <>
           <p className={report.status === "safe" ? "success" : "banner"}>{report.summary}</p>
@@ -69,19 +68,19 @@ export function ChecksScreen() {
               {primary.map((check) => (
                 <li key={check.name}>
                   <strong>{check.name}</strong>
-                  <span className={check.ok ? "badge ok" : "badge bad"}>{check.ok ? "Passed" : "Did not pass"}</span>
+                  <span className={check.ok ? "badge ok" : "badge bad"}>{check.ok ? "Passed" : "Failed"}</span>
                 </li>
               ))}
             </ul>
           ) : null}
           {rest.length > 0 ? (
             <>
-              <h2>Also checked</h2>
+              <h2>Other checks</h2>
               <ul className="plain-list">
                 {rest.map((check) => (
                   <li key={check.name}>
                     <strong>{check.name}</strong>
-                    <span className={check.ok ? "badge ok" : "badge bad"}>{check.ok ? "Passed" : "Did not pass"}</span>
+                    <span className={check.ok ? "badge ok" : "badge bad"}>{check.ok ? "Passed" : "Failed"}</span>
                   </li>
                 ))}
               </ul>
@@ -89,7 +88,7 @@ export function ChecksScreen() {
           ) : null}
           {failed ? (
             <details>
-              <summary>Show details</summary>
+              <summary>Details for IT</summary>
               <ul>
                 {report.checks
                   .filter((check) => !check.ok && check.developer_detail)

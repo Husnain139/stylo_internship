@@ -11,6 +11,7 @@ from .config import (
     RETRIEVE_CANDIDATES,
     RETRIEVE_TOP_K,
 )
+from .clauses import asked_clause, asked_page, contains_clause, heading_has_phrase, heading_phrases
 from .models import Passage
 from .textutil import keyword_score, token_list, token_set
 
@@ -27,10 +28,34 @@ def _keep(passage: Passage) -> bool:
 
 
 _NEGATIVE = {"not", "no", "excluded", "cease", "without", "longer"}
+_GENERIC = {"short", "brief", "summary", "point", "points", "section", "clause", "heading", "explain", "describe"}
 
 
-def search_passages(store, embedding: list[float], query: str, audiences: set[str], today: date) -> list[Passage]:
-    raw = store.candidates(embedding, query, audiences, today, RETRIEVE_CANDIDATES)
+def search_passages(
+    store, embedding: list[float], query: str, audiences: set[str], today: date,
+    *, policy_ids: list[str] | None = None,
+) -> list[Passage]:
+    scope = {} if policy_ids is None else {"policy_ids": policy_ids}
+    raw = store.candidates(embedding, query, audiences, today, RETRIEVE_CANDIDATES, **scope)
+    number = asked_clause(query)
+    phrases = heading_phrases(query)
+    page_number = asked_page(query)
+    seen = {passage.id for passage in raw}
+    if number and hasattr(store, "clause_hits"):
+        for extra in store.clause_hits([number], audiences, today, **scope):
+            if extra.id not in seen:
+                raw.append(extra)
+                seen.add(extra.id)
+    if phrases and hasattr(store, "heading_hits"):
+        for extra in store.heading_hits(phrases, audiences, today, **scope):
+            if extra.id not in seen:
+                raw.append(extra)
+                seen.add(extra.id)
+    if page_number and hasattr(store, "printed_page_hits"):
+        for extra in store.printed_page_hits(page_number, audiences, today, **scope):
+            if extra.id not in seen:
+                raw.append(extra)
+                seen.add(extra.id)
     words = token_set(query)
     negative = bool(words & _NEGATIVE)
     asks_for_form = bool(words & {"template", "form", "details"})
@@ -44,11 +69,77 @@ def search_passages(store, embedding: list[float], query: str, audiences: set[st
             passage.score += 0.2
         if asks_for_form and passage.content_type == "form":
             passage.score += 0.15
+        named = _names_this(passage, phrases, page_number)
+        if number and contains_clause(f"{passage.heading}\n{passage.body}", number):
+            passage.kw_score = 1.0
+            passage.score = 0.65 * max(passage.vec_score, 0.0) + 0.85
+        elif named:
+            passage.kw_score = 1.0
+            passage.score = 0.65 * max(passage.vec_score, 0.0) + 0.85
         if _keep(passage):
             kept.append(passage)
-    kept = _prefer_distinctive(query, kept)
+    def protected(passage: Passage) -> bool:
+        if number and contains_clause(f"{passage.heading}\n{passage.body}", number):
+            return True
+        return _names_this(passage, phrases, page_number)
+
+    if number or phrases or page_number:
+        named_passages = [passage for passage in kept if protected(passage)]
+        others = [passage for passage in kept if passage not in named_passages]
+        kept = named_passages + _prefer_distinctive(query, others)
+    else:
+        kept = _prefer_distinctive(query, kept)
     kept.sort(key=lambda passage: passage.score, reverse=True)
+    named = [passage for passage in kept if _phrase_count(passage, phrases)]
+    if named:
+        best = max(_phrase_count(passage, phrases) for passage in named)
+        named = [passage for passage in named if _phrase_count(passage, phrases) == best]
+    on_page = [passage for passage in kept if _on_printed_page(passage, page_number, kept)]
+    if named or on_page:
+        merged = []
+        seen_ids = set()
+        for passage in named + on_page:
+            if passage.id in seen_ids:
+                continue
+            seen_ids.add(passage.id)
+            merged.append(passage)
+        if merged:
+            top = max(passage.score for passage in merged)
+            for passage in merged:
+                passage.score = top
+        return merged[:16]
+    if kept and kept[0].content_type == "table" and hasattr(store, "heading_rows"):
+        same = [passage for passage in kept if passage.heading == kept[0].heading]
+        if len(same) >= 3:
+            rows = store.heading_rows(kept[0].policy_id, kept[0].heading, audiences, today)
+            if len(rows) >= len(same):
+                return rows[:16]
     return kept[:RETRIEVE_TOP_K]
+
+
+def _phrase_count(passage: Passage, phrases: list[str]) -> int:
+    heading = f"{passage.heading}\n{passage.heading_path}"
+    return sum(1 for phrase in phrases if heading_has_phrase(heading, phrase))
+
+
+def _on_printed_page(passage: Passage, page_number: int, kept: list[Passage]) -> bool:
+    if not page_number:
+        return False
+    pages = {
+        (item.policy_id, item.page)
+        for item in kept
+        if item.heading.lower().startswith(f"page {page_number} of")
+    }
+    return (passage.policy_id, passage.page) in pages
+
+
+def _names_this(passage: Passage, phrases: list[str], page_number: int) -> bool:
+    heading = f"{passage.heading}\n{passage.heading_path}"
+    if any(heading_has_phrase(heading, phrase) for phrase in phrases):
+        return True
+    if page_number and passage.heading.lower().startswith(f"page {page_number} of"):
+        return True
+    return False
 
 
 def _typo_match(query: str, text: str) -> bool:
@@ -89,7 +180,7 @@ def _prefer_distinctive(query: str, passages: list[Passage]) -> list[Passage]:
     """Keep the passages that match the specific words, such as summary or retail."""
     if len(passages) < 2:
         return passages
-    distinctive = [token for token in set(token_list(query)) if len(token) >= 5]
+    distinctive = [token for token in set(token_list(query)) if len(token) >= 5 and token not in _GENERIC]
 
     def hits(passage: Passage) -> int:
         text = f"{passage.heading_path} {passage.heading} {passage.body}"
@@ -107,4 +198,8 @@ def select_passages(passages: list[Passage]) -> list[Passage]:
         return []
     best = passages[0].score
     chosen = [passage for passage in passages if passage.score >= best - PASSAGE_SCORE_WINDOW]
+    one_policy = len({passage.title for passage in chosen}) == 1
+    tied = len({round(passage.score, 2) for passage in chosen}) == 1
+    if len(chosen) > MAX_PASSAGES and (tied or (one_policy and len({passage.page for passage in chosen}) <= 2)):
+        return chosen[:16]
     return chosen[:MAX_PASSAGES]

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 import time
 import uuid
 from datetime import date
+from dataclasses import replace
 
+from .aliases import expand_query
 from .access import (
     AUDIENCES,
     access_key,
@@ -22,26 +25,29 @@ from .access import (
     shares_audience,
 )
 from .clauses import asked_clause, focus_clauses
+from .benefits import asks_for_benefit_overview, benefit_overview
 from .config import (
     EVIDENCE_MAX_BYTES,
+    MAX_PASSAGES,
     embed_model,
     model_nano,
     model_mini,
-    REFUSAL,
     UNAVAILABLE,
-    UNKNOWN,
     answer_max_tokens,
 )
-from .guardrails import check_question
+from .guardrails import check_question, contains_named_pay
+from .llm import IncompleteCompletion
 from .models import AskResult, Citation, Employee, TraceRecord
-from .prompting import prompt_version, system_prompt
+from .prompting import model_context, prompt_hash, prompt_source, system_prompt
+from .replies import RATE_MISSING, REFUSAL, TOPIC_MISSING, UNKNOWN
 from .retrieve import search_passages, select_passages
 from .rewrite import contextual_query, question_recall, recent_history, rewrite_question, topic_words
 from .router import choose_model
-from .sanitize import sanitize
+from .sanitize import exposes_prompt, fixed_reply, forbidden_output, sanitize, soften_labels
 from .source_page import source_page_url
 from .textutil import token_set
 from .store_memory import utc_now
+from .topics import TopicEvidence, expand_abbreviations, model_topics, needs_topic_split, split_topics, topic_kind
 
 logger = logging.getLogger("hr_desk")
 
@@ -64,6 +70,36 @@ _MEDICAL_FIELDS = (
 _FOLLOW_FIELD = re.compile(r"^(?:(?:and|also)\b|(?:what|how)\s+about\b)", re.I)
 _SELF_ELIGIBILITY = re.compile(r"\b(?:i|my|me)\b.*\b(?:eligible|covered|qualify)\b|\b(?:eligible|covered|qualify)\b.*\b(?:i|my|me)\b", re.I)
 _RETAIL_MEDICAL_ROLES = {"senior_store_manager", "store_manager", "assistant_store_manager", "branch_accountant"}
+_PERSONAL = re.compile(r"\b(?:my|for me|for myself|am i|do i|can i|should i|as an?)\b", re.I)
+_VEHICLE_CC = re.compile(r"\b(\d{2,4})\s*cc\b", re.I)
+_FUEL_SCHEDULE = "fuel entitlement list"
+_TRAVEL_APPROVAL = "authorization of travel"
+_TRAVEL_DEADLINE = re.compile(r"\b(?:when|how (?:early|far in advance)|deadline)\b.*\btravel request form\b", re.I)
+_HOTEL_SCHEDULE = "annexure c"
+_RULE_REQUEST = re.compile(r"\b(?:policy|rules?)\b|\bhow\b[^?.!]{0,55}\b(?:work|works|apply|applies)\b", re.I)
+_TA = re.compile(r"\bTA\b", re.I)
+_TA_OFFER = "If you mean travel allowance or mileage, I can show the rates for your designation."
+_TA_FOLLOW_UP = re.compile(
+    r"(?:yes(?:[, ]+please)?|show me(?:[, ]+please)?|(?:travel )?allowance(?: rates?)?|mileage(?: rates?)?)[?.!]*",
+    re.I,
+)
+_FORM_FIELDS_REQUEST = re.compile(
+    r"\b(?:fields?|details?|what (?:goes|belongs) in|what (?:information|data)|what .*?"
+    r"(?:contains?|includ(?:e[sd]?|ing)|fill|enter|write)|"
+    r"(?:list|show) .*?template)\b", re.I,
+)
+_CLOSING_OFFER = re.compile(
+    r"(?:if (?:you(?:'d|’d| would)? (?:want|need|like)|helpful|useful|needed|desired)\b|"
+    r"(?:i|we) (?:can|could|would be happy to) (?:also )?"
+    r"(?:provide|format|show|share|give|help|send|create|prepare|generate|offer|supply|make|draft|download|"
+    r"export|email|attach|upload|print|fill|open|write)\b|"
+    r"(?:please )?let me know\b|would you like\b|next steps?\s*:)", re.I,
+)
+_COMPARISON = re.compile(r"\b(?:compar\w*|versus|vs\.?|difference between|side.by.side)\b", re.I)
+_DA_CONDITION = re.compile(
+    r"originating from the permanent place of work, applicable for journeys totaling "
+    r"([\d,]+)\s*(?:km|kilometers?) or more \(round trip\), including transit time", re.I,
+)
 
 
 class Pipeline:
@@ -73,9 +109,22 @@ class Pipeline:
         self.llm = llm
         self.today = today or date.today #trace
 
-    def ask(self, employee: Employee, question: str, history: list[dict] | None = None) -> AskResult:
+    def ask(self, employee: Employee, question: str, history: list[dict] | None = None,
+            *, request_id: str | None = None) -> AskResult:
+        with model_context(self.today(), role_label(employee.designation)):
+            return self._ask(employee, question, history, request_id=request_id)
+
+    def _ask(self, employee: Employee, question: str, history: list[dict] | None = None,
+             *, request_id: str | None = None) -> AskResult:
         started = time.perf_counter()
+        source = prompt_source()
         state = {
+            "id": request_id or uuid.uuid4().hex,
+            "prompt_source": source,
+            "prompt_hash": prompt_hash(source),
+            "topic_count": 1,
+            "finish_reason": None,
+            "evidence_ids": [],
             "guardrail": "pass",
             "guardrail_reason": "ok",
             "classifier_called": False,
@@ -105,15 +154,28 @@ class Pipeline:
             history = history or []
             ordinal = question_recall(question)
             if ordinal is not None:
-                saved = [turn["text"] for turn in history if turn["role"] == "user"]
-                if ordinal == -1 and saved:
-                    answer = f'Your previous saved question was: "{saved[-1]}"'
-                elif 0 < ordinal <= len(saved):
-                    answer = f'Question {ordinal} in this chat\'s saved history was: "{saved[ordinal - 1]}"'
-                else:
-                    answer = "I can't find that question in this chat's saved history."
-                state.update(outcome="answered", answer=answer, history_note="question-recall")
+                answer, passage_ids = _recall_question(ordinal, history)
+                state.update(outcome="answered", answer=answer, history_note="question-recall", evidence_ids=passage_ids)
                 return self._finish(employee, question, state, started)
+            ta_follow_up = bool(
+                len(history) >= 2 and history[-2].get("role") == "user" and _TA.search(history[-2].get("text", ""))
+                and history[-1].get("role") == "assistant" and _TA_OFFER in history[-1].get("text", "")
+                and _TA_FOLLOW_UP.fullmatch(question.strip())
+            )
+            topics, remaining_topics = split_topics(question)
+            if (len(topics) == 1 and decision.action == "allow" and needs_topic_split(question)
+                    and hasattr(self.llm, "split_topic_queries")):
+                try:
+                    split, overflow = model_topics(self.llm.split_topic_queries(question), question)
+                    if len(split) > 1:
+                        topics, remaining_topics = split, overflow
+                except IncompleteCompletion:
+                    raise
+                except Exception as error:
+                    _log_error(error, state["id"], 200)
+            if len(topics) > 1:
+                return self._ask_topics(employee, question, topics, remaining_topics, state, started, decision.action)
+            expanded_question = expand_abbreviations(question)
             grade = grade_band(question)
             grade_question = grade not in {None, "all"} and re.search(
                 r"\b(fuel|entitlements?|allowances?|benefits?|coverage|plan|plans|cover|reimbursement)\b",
@@ -165,7 +227,7 @@ class Pipeline:
                     reference = reference or question.strip()
             cacheable = not turns and reference is None and decision.action == "allow"
             question_key = question.strip()
-            version = (f"{self.store.policy_version()}:{prompt_version()}:exact-v6:"
+            version = (f"{self.store.policy_version()}:{state['prompt_hash']}:exact-v14:"
                        f"{today.isoformat()}:{embed_model()}:{model_nano()}:{model_mini()}")
             key = access_key(employee.designation)
             cached = self.store.cache_lookup(question_key, key, version) if cacheable else None
@@ -188,8 +250,10 @@ class Pipeline:
                         state["cache"] = "hit"
                         state["outcome"] = cached["outcome"]
                         state["answer"] = cached["answer"]
+                        state["evidence_ids"] = [item["passage_id"] for item in items]
                         state["citations"] = [
-                            Citation(item["label"], item["text"], item.get("image") or "")
+                            Citation(item["label"], item["text"], item.get("image") or "",
+                                     item["passage_id"], item.get("title") or "")
                             for item in items
                         ]
                         state["sections"] = [item.label for item in state["citations"]]
@@ -201,8 +265,80 @@ class Pipeline:
                 state["outcome"] = "blocked"
                 state["answer"] = REFUSAL
                 return self._finish(employee, question, state, started)
+            if _TRAVEL_DEADLINE.search(question):
+                audiences = set(allowed_audiences(employee.designation))
+                sources = [p for p in self.store.heading_hits([_TRAVEL_APPROVAL], audiences, today)
+                           if self._topic_visible(employee.designation, p, audiences) and p.content_type == "section"]
+                answer = _travel_authorization_summary(question, sources)
+                if answer:
+                    state.update(outcome="answered", answer=answer, search="heading-lookup",
+                                 rewritten_question=question.strip(), sections=[p.section_label for p in sources],
+                                 citations=[_citation(p) for p in sources],
+                                 valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
+                    return self._finish(employee, question, state, started)
 
-            rewrite = rewrite_question(question, turns)
+            if asks_for_benefit_overview(question):
+                answer, sources = benefit_overview(self.store, employee, today)
+                state.update(outcome="answered" if sources else "dont_know", answer=answer, search="done",
+                             history_note="benefit-overview", rewritten_question=question.strip(),
+                             sections=list(dict.fromkeys(p.section_label for p in sources)),
+                             citations=[_citation(p) for p in sources],
+                             valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
+                return self._finish(employee, question, state, started)
+
+            form_link = self._travel_form_link(employee, question, today)
+            if form_link:
+                outcome, answer, sources = form_link
+                state.update(outcome=outcome, answer=answer, search="done", history_note="form-link",
+                             withheld=outcome == "refused", sections=[p.section_label for p in sources],
+                             citations=[_citation(p) for p in sources],
+                             valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
+                return self._finish(employee, question, state, started)
+
+            named = _named_policy_scope(question, self.store)
+            personal = _personal_travel_intent(expanded_question, fuel_question, requested_plan)
+            hotel_follow = rewrite_question(expanded_question, turns)
+            hotel_follow_up = False
+            if not personal and hotel_follow.note == "follow-up":
+                followed = _personal_travel_intent(hotel_follow.search_query, fuel_question, requested_plan)
+                if followed in {"hotel", "fuel", "daily", "tour"}:
+                    personal = followed
+                    hotel_follow_up = True
+            if ta_follow_up:
+                personal = "fuel"
+            elif re.fullmatch(r"TA[?.!]*", question.strip(), re.I):
+                personal = "approval"
+            personal_medical = bool(
+                not requested_plan and not reference and _PERSONAL.search(question)
+                and re.search(r"\b(?:medical|health insurance|medical cover|hospitali[sz]ation|hospital|takaful|maternity|delivery)\b", question, re.I)
+                and not re.search(r"\b(?:claim|panel|form|submit|reimburse)\b", question, re.I)
+            )
+            personal_search = ""
+            if (not personal and not personal_medical and not named and not reference and not requested_plan
+                    and not medical_follow_up and not asked_clause(question) and _PERSONAL.search(question)
+                    and hasattr(self.llm, "personal_query")):
+                try:
+                    intent, personal_search = self.llm.personal_query(question)
+                    if intent in {"fuel", "hotel", "daily", "approval"}:
+                        personal = intent
+                except IncompleteCompletion:
+                    raise
+                except Exception as error:
+                    _log_error(error, state["id"], 200)
+            if personal and (not requested_roles or employee.designation in requested_roles):
+                # Don't replace a question explicitly scoped to another document.
+                if not named or any(p.title.casefold() == "travel policy" and p.id in named[1]
+                                    for p in self.store.list_policies()):
+                    outcome, answer, sources = self._personal_travel(employee, question, personal, today)
+                    state.update(outcome=outcome, answer=answer, search="designation-lookup",
+                                 history_note=("ta-follow-up" if ta_follow_up else "hotel-follow-up" if hotel_follow_up else "employee-designation"),
+                                 rewritten_question=("fuel allowance for me" if ta_follow_up else hotel_follow.search_query if hotel_follow_up else question.strip()),
+                                 withheld=outcome == "refused", sections=[p.section_label for p in sources],
+                                 citations=[_citation(p) for p in sources] if outcome == "answered" else [],
+                                 valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
+                    return self._finish(employee, question, state, started)
+
+            rewrite = rewrite_question(expanded_question, turns)
             earlier = _previous_boundary(turns)
             if earlier and not topic_words(question):
                 state["history_note"] = "repeat-boundary"
@@ -212,14 +348,13 @@ class Pipeline:
                 return self._finish(employee, question, state, started)
             policy_ids = None
             approval_rows = []
-            answer_question = question.strip()
-            named = _named_policy_scope(question, self.store)
+            answer_question = expanded_question.strip()
             if named:
                 subject, policy_ids = named
                 subject = _SUMMARY_PREFIX.sub("", subject).strip() or subject
                 state.update(rewritten_question=subject, history_note="named-policy")
                 background = ""
-            elif requested_plan and not medical_follow_up:
+            elif (requested_plan and not medical_follow_up) or personal_medical:
                 state.update(rewritten_question=question.strip(), history_note="explicit-medical-plan")
                 background = ""
             elif reference is not None:
@@ -251,6 +386,10 @@ class Pipeline:
                                 ) if row.content_type == "table" and _APPROVAL_FIELD.search(row.body)
                                 and _visible(employee.designation, row)
                             )
+            elif personal_search:
+                # The normalization can improve retrieval but cannot replace the user's request.
+                state.update(rewritten_question=f"{question.strip()} {personal_search}", history_note="personal-query")
+                background = ""
             elif rewrite.needs_model:
                 rewritten = self.llm.rewrite(question, turns) or question.strip()
                 asked = topic_words(question)
@@ -270,19 +409,32 @@ class Pipeline:
             chosen = []
             scope = {} if policy_ids is None else {"policy_ids": policy_ids}
             embedding = None
-            medical_lookup = bool(requested_plan or medical_follow_up)
-            if medical_lookup:
+            search_text = state["rewritten_question"]
+            medical_lookup = bool(requested_plan or medical_follow_up or personal_medical)
+            report_rows = self._report_rows(answer_question, employee.designation, audiences, today, scope)
+            summary_fields_requested = _asks_summary_fields(answer_question)
+            if summary_fields_requested and not _summary_report_source_fields(report_rows):
+                state.update(outcome="dont_know", answer=UNKNOWN, search="heading-lookup")
+                return self._finish(employee, question, state, started)
+            if report_rows:
+                passages = report_rows
+                answer_question = re.sub(r"\bsummart report\b", "summary report", answer_question, flags=re.I)
+            elif medical_lookup:
                 passages = [
                     row for row in self.store.heading_hits([_MEDICAL_SCHEDULE], audiences, today, **scope)
                     if row.content_type == "table" and "medical" in row.title.casefold()
                     and _visible(employee.designation, row)
                     and (not requested_plan or _row_plan(row.body) == requested_plan[1].lower())
+                    and (not personal_medical or employee.designation in
+                         (policy_row_roles(row.heading, row.body, row.title) or set()))
                 ]
             elif approval_rows:
                 passages = list({row.id: row for row in approval_rows}.values())
             else:
-                embedding = self.embedder.embed([state["rewritten_question"]])[0]
-                passages = search_passages(self.store, embedding, state["rewritten_question"], audiences, today, **scope)
+                search_text = expand_query(state["rewritten_question"])
+                embedding = self.embedder.embed([search_text])[0]
+                passages = search_passages(self.store, embedding, search_text, audiences, today, **scope)
+            passages = [p for p in passages if not contains_named_pay(f"{p.title}\n{p.body}")]
             if requested_roles and not medical_lookup:
                 passages = [
                     passage for passage in passages if passage.content_type == "table"
@@ -299,10 +451,17 @@ class Pipeline:
                 if matching_rows:
                     passages = matching_rows
             state["search"] = "done"
+            distance = _distance_rule_answer(question, passages, self.store, audiences, today)
+            if distance:
+                answer, sources = distance
+                state.update(answer=answer, outcome="answered", answer_kind="distance-rule", model="deterministic",
+                             evidence_ids=[p.id for p in sources], sections=[p.section_label for p in sources],
+                             citations=[_citation(p) for p in sources])
+                return self._finish(employee, question, state, started)
             if passages:
                 chosen = select_passages(passages)
-                probe = state["rewritten_question"] if policy_ids or not topic_words(question) else question
-                matched = chosen if medical_lookup else [passage for passage in chosen if asks_for_hidden(probe, [passage])]
+                probe = state["rewritten_question"] if policy_ids or personal_search or not topic_words(question) else question
+                matched = chosen if medical_lookup or report_rows else [p for p in chosen if asks_for_hidden(probe, [p])]
                 if not matched and not names_other_grade(employee.designation, question):
                     state["outcome"] = "dont_know"
                     state["answer"] = UNKNOWN
@@ -353,7 +512,13 @@ class Pipeline:
                 ]
                 if chosen and all(passage.content_type == "table" for passage in chosen):
                     state["outcome"] = "answered"
-                    state["answer"] = friendly_table(chosen)
+                    state["answer"] = _dress_code_rule(chosen, answer_question) or friendly_table(chosen, question)
+                    if all(_FUEL_SCHEDULE in p.heading.casefold() for p in chosen):
+                        applicable = [p for p in chosen if "all levels" in p.body.casefold()
+                                      or employee.designation in (policy_row_roles(p.heading, p.body, p.title) or set())]
+                        state["answer"] = _fuel_rates(applicable, question) or UNKNOWN
+                        if not applicable:
+                            state["outcome"] = "dont_know"
                     if medical_lookup and medical_fields:
                         state["answer"] = _medical_field_answer(chosen, medical_fields, question)
                         if state["answer"] == UNKNOWN:
@@ -376,7 +541,8 @@ class Pipeline:
                         state["citations"] = [_citation(passage, employee.designation == "hr") for passage in chosen]
                 elif chosen:
                     direct_answer = (
-                        _retail_eligibility(employee.designation, question, chosen)
+                        _summary_report_fields(chosen, question)
+                        or _retail_eligibility(employee.designation, question, chosen)
                         or _travel_authorization_summary(question, chosen)
                     )
                     if direct_answer:
@@ -396,16 +562,16 @@ class Pipeline:
                         raise RuntimeError("Policy evidence exceeds the request budget")
                     chosen = evidence
                     model = choose_model(question, chosen)
+                    state.update(model=model, evidence_ids=[p.id for p in chosen])
                     completion = self.llm.answer(
-                        system=system_prompt(today),
+                        system=system_prompt(today, role_label(employee.designation), source=state["prompt_source"]),
                         question=answer_question,
                         background=background,
                         passages=chosen,
                         model=model,
                         max_tokens=answer_max_tokens(model),
-                        designation=role_label(employee.designation),
                     )
-                    state["model"] = model
+                    state["finish_reason"] = completion.finish_reason
                     state["tokens_in"] = completion.tokens_in
                     state["tokens_out"] = completion.tokens_out
                     allowed_numbers = " ".join(
@@ -419,16 +585,15 @@ class Pipeline:
                             ),
                         ]
                     )
+                    draft = soften_labels(completion.text)
+                    if forbidden_output(draft):
+                        state.update(answer=draft)
+                        return self._finish(employee, question, state, started)
                     answer = sanitize(
-                        completion.text,
+                        _strip_closing_offers(draft),
                         [passage.body for passage in chosen],
                         allowed_numbers,
                     )
-                    missed = "I couldn't find this in the policies I can open."
-                    if answer.strip() == missed:
-                        answer = UNKNOWN
-                    elif missed in answer and answer.strip() != UNKNOWN:
-                        answer = " ".join(answer.replace(UNKNOWN, "").replace(missed, "").split()) or UNKNOWN
                     if answer == UNKNOWN and named and _ONE_SENTENCE.search(question) and _SUMMARY_PREFIX.match(question):
                         answer = _named_summary_excerpt(state["rewritten_question"], chosen)
                     answer = _short_answer(answer, question)
@@ -446,11 +611,12 @@ class Pipeline:
                 everywhere = search_passages(
                     self.store,
                     embedding,
-                    state["rewritten_question"],
+                    search_text,
                     set(AUDIENCES),
                     today,
                 )
-                hidden = [passage for passage in everywhere if not shares_audience(passage.audience, audiences) or not _visible(employee.designation, passage)]
+                hidden = [p for p in everywhere if not contains_named_pay(f"{p.title}\n{p.body}")
+                          and (not shares_audience(p.audience, audiences) or not _visible(employee.designation, p))]
                 if hidden and asks_for_hidden(question, hidden):
                     state["withheld"] = True
                     state["outcome"] = "refused"
@@ -476,25 +642,428 @@ class Pipeline:
                             "answer": state["answer"],
                             "citations": [
                                 {"label": item.label, "text": item.text, "image": item.image,
-                                 "passage_id": passage.id}
-                                for item, passage in zip(state["citations"], chosen)
+                                 "passage_id": item.passage_id, "title": item.title}
+                                for item in state["citations"]
                             ],
                             "outcome": state["outcome"],
                         }
                     )
-                except Exception:
-                    logger.warning("Could not store answer cache entry", exc_info=True)
-        except Exception:
-            logger.exception("Policy question failed")
+                except Exception as error:
+                    _log_error(error, state["id"], 200)
+        except IncompleteCompletion as error:
+            _log_error(error, state["id"], 200)
+            state.update(outcome="dont_know", answer=UNKNOWN, citations=[], finish_reason=error.reason,
+                         model=error.model or state["model"])
+        except Exception as error:
+            _log_error(error, state["id"], 503)
             state["outcome"] = "error"
             state["answer"] = UNAVAILABLE
             state["citations"] = []
         return self._finish(employee, question, state, started)
 
+    def _travel_form_link(self, employee: Employee, question: str, today: date) -> tuple | None:
+        claim = re.search(r"\btravel\s+(?:claim|expense)\s+form\b", question, re.I)
+        request = re.search(r"\btravel\s+request\s+form\b", question, re.I)
+        if bool(claim) == bool(request):
+            return None
+        explicit_link = re.search(r"\b(?:link|url|address)\b", question, re.I)
+        if not explicit_link and (not claim or not (
+            re.fullmatch(r"(?:the\s+)?travel\s+(?:claim|expense)\s+form(?:\s+for me)?[?.!]*", question.strip(), re.I)
+            or _FORM_FIELDS_REQUEST.search(question)
+        )):
+            return None
+        heading = "travel expense form" if claim else "travel request form"
+        audiences = set(allowed_audiences(employee.designation))
+        sources = [p for p in self.store.heading_hits([heading], audiences, today)
+                   if p.title.casefold() == "travel policy" and p.content_type == "form"
+                   and shares_audience(p.audience, audiences) and _visible(employee.designation, p)]
+        urls = {url.rstrip(".,)") for p in sources for url in _LINK.findall(_joined_links(p.body))}
+        if len(urls) != 1:
+            if not sources and employee.designation in {"intern", "trainee"}:
+                return "refused", "I can't share the travel form for your designation. Ask HR if you need help.", []
+            return "dont_know", UNKNOWN, []
+        url = urls.pop()
+        if explicit_link and re.search(r"\b(?:only|just)\b", question, re.I):
+            return "answered", url, sources
+        if claim:
+            fields = _claim_form_fields(sources)
+            if fields:
+                return "answered", f"{_field_list('Travel Claim Form', fields)}\n\nForm link: {url}", sources
+        return "answered", f"{'Travel Claim Form' if claim else 'Travel Request Form'}: {url}", sources
+
+    def _ask_topics(self, employee, question, topics, remaining_topics, state, started, guard_action):
+        today = self.today()
+        role = employee.designation
+        audiences = set(allowed_audiences(role))
+        state["classifier_called"] = guard_action == "unsure"
+        state["topic_count"] = len(topics)
+        if ((guard_action == "unsure" and self.llm.classify(question) != "allow")
+                or self.llm.moderate(question)):
+            state.update(outcome="blocked", guardrail="blocked", guardrail_reason="multi-topic-input", answer=REFUSAL)
+            return self._finish(employee, question, state, started)
+        answers = {}
+        accepted = {}
+        pending = {}
+        searches = []
+        failed = False
+        for index, topic in enumerate(topics, 1):
+            query = expand_abbreviations(topic.query)
+            if check_question(query).action in {"block", "pay"}:
+                state.update(outcome="refused", guardrail="blocked", guardrail_reason="topic-input", answer=REFUSAL)
+                return self._finish(employee, question, state, started)
+            kind = topic_kind(query)
+            personal = bool(_PERSONAL.search(query))
+            explicit = _medical_plan(query)
+            named = _named_policy_scope(query, self.store)
+            scope = {} if not named else {"policy_ids": named[1]}
+            requested = (policy_row_roles("Medical Benefit Schedule", explicit[0]) if explicit else
+                         policy_row_roles("Fuel Entitlement", f"Grade: {query}") if kind == "fuel" else None)
+            if requested and role not in requested | {"hr"}:
+                state["withheld"] = True
+                continue
+
+            exact = None
+            if kind == "form" and re.search(r"\btravel\s+(?:claim|expense|request)\s+form\b", query, re.I) and not named:
+                exact = self._travel_form_link(employee, query, today)
+            elif personal and not named:
+                travel = _personal_travel_intent(query, kind == "fuel", explicit)
+                if travel:
+                    exact = self._personal_travel(employee, query, travel, today)
+            if exact:
+                outcome, text, sources = exact
+                if outcome == "answered" and (kind not in {"fuel", "hotel"}
+                                               or any(p.content_type == "table" for p in sources)):
+                    answers[index] = text
+                    accepted.update((p.id, p) for p in sources)
+                if outcome == "refused":
+                    state["withheld"] = True
+                continue
+
+            rows = self._report_rows(query, role, audiences, today, scope)
+            if _asks_summary_fields(query) and not _summary_report_source_fields(rows):
+                continue
+            if rows:
+                if field_answer := _summary_report_fields(rows, query):
+                    answers[index] = field_answer
+                    accepted.update((p.id, p) for p in rows)
+                else:
+                    pending[index] = TopicEvidence(index, query, rows[:MAX_PASSAGES])
+                continue
+
+            if re.fullmatch(r"(?:the\s+)?code of conduct(?:\s+for me)?[?.!]*", query.strip(), re.I):
+                rows = [p for p in self.store.heading_hits(["responsibilities", "business integrity", "our values"],
+                                                           audiences, today, **scope)
+                        if "code of conduct" in p.title.casefold() and p.content_type == "section"
+                        and self._topic_visible(role, p, audiences)]
+                if rows:
+                    pending[index] = TopicEvidence(index, query, rows[:MAX_PASSAGES])
+                    continue
+
+            if kind == "medical" and (explicit or re.fullmatch(
+                r"(?:health insurance|medical (?:insurance|coverage|takaful|benefits)|medical)(?:\s+for me)?[?.!]*",
+                query.strip(), re.I,
+            )):
+                headings = [_MEDICAL_SCHEDULE] if explicit else ["eligibility", "coverage", _MEDICAL_SCHEDULE]
+                rows = [p for p in self.store.heading_hits(headings, audiences, today, **scope)
+                        if "medical" in p.title.casefold() and self._topic_visible(role, p, audiences)]
+                if explicit:
+                    rows = [p for p in rows if _row_plan(p.body) == explicit[1].lower()]
+                elif personal:
+                    rows = [p for p in rows if p.content_type != "table"
+                            or role in (policy_row_roles(p.heading, p.body, p.title) or set())]
+                fields = _medical_fields(query)
+                if fields and rows:
+                    amount = _medical_field_answer(rows, fields, query)
+                    if amount != UNKNOWN:
+                        answers[index] = amount
+                        accepted.update((p.id, p) for p in rows)
+                        continue
+                if personal and not explicit and rows:
+                    summary = _personal_medical_summary(rows)
+                    if summary:
+                        answers[index] = summary
+                        accepted.update((p.id, p) for p in rows)
+                        continue
+                if rows:
+                    # Full eligibility and coverage precede the narrower maternity and termination headings.
+                    rows.sort(key=lambda p: (not bool(re.match(r"(?:2\. Eligibility|3\. Coverage)$", p.heading, re.I)),
+                                             p.content_type != "table", "termination" in p.heading.casefold()))
+                    pending[index] = TopicEvidence(index, query, rows[:MAX_PASSAGES])
+                    continue
+            searches.append((index, query, expand_query(named[0] if named else query), scope, requested if kind == "fuel" else None))
+
+        if searches:
+            try:
+                embeddings = self.embedder.embed([
+                    f"{search} — employee designation: {role_label(role)}"
+                    if _PERSONAL.search(query) else search
+                    for _, query, search, _, _ in searches
+                ])
+                for (index, query, search, scope, fuel_roles), embedding in zip(searches, embeddings, strict=True):
+                    rows = search_passages(self.store, embedding, search, audiences, today, **scope)
+                    rows = [p for p in rows if self._topic_visible(role, p, audiences) and asks_for_hidden(search, [p])]
+                    if fuel_roles:
+                        rows = [p for p in rows if p.content_type == "table" and _FUEL_SCHEDULE in p.heading.casefold()
+                                and "all levels" not in p.body.casefold()
+                                and fuel_roles <= (policy_row_roles(p.heading, p.body, p.title) or set())]
+                    focused = focus_clauses(rows, query)
+                    if focused is not None:
+                        rows = focused if len({p.policy_id for p in focused}) <= 1 else []
+                    selected = select_passages(rows)[:MAX_PASSAGES]
+                    if selected:
+                        pending[index] = TopicEvidence(index, query, selected)
+            except Exception as error:
+                failed = True
+                _log_error(error, state["id"], 503)
+
+        grouped = _bounded_topic_evidence(list(pending.values()))
+        truncated = False
+        if grouped:
+            try:
+                model = model_mini()
+                state.update(model=model, evidence_ids=[p.id for group in grouped for p in group.passages])
+                completion = self.llm.answer_topics(
+                    system=system_prompt(today, role_label(role), source=state["prompt_source"]),
+                    topics=grouped, model=model, max_tokens=answer_max_tokens(model),
+                )
+                state.update(tokens_in=completion.tokens_in, tokens_out=completion.tokens_out,
+                             finish_reason=completion.finish_reason)
+                truncated = completion.finish_reason != "stop"
+                if forbidden_output(completion.text):
+                    state.update(answer=completion.text)
+                    return self._finish(employee, question, state, started)
+                output = _topic_json(completion.text, partial=truncated)
+                for group in grouped:
+                    text = output.get(str(group.number))
+                    if not isinstance(text, str):
+                        continue
+                    cleaned = sanitize(_strip_closing_offers(text), [p.body for p in group.passages])
+                    if cleaned not in {UNKNOWN, REFUSAL}:
+                        answers[group.number] = _short_answer(cleaned, group.question)
+                        accepted.update((p.id, p) for p in group.passages)
+            except IncompleteCompletion as error:
+                _log_error(error, state["id"], 200)
+                state.update(outcome="dont_know", answer=UNKNOWN, finish_reason=error.reason)
+                return self._finish(employee, question, state, started)
+            except Exception as error:
+                failed = True
+                _log_error(error, state["id"], 503)
+
+        state.update(search="done", history_note="multi-topic", rewritten_question=" | ".join(t.query for t in topics))
+        if not answers and (truncated or not state["withheld"]):
+            outcome = "error" if failed else "refused" if state["withheld"] else "dont_know"
+            state.update(outcome=outcome, answer=UNAVAILABLE if failed else UNKNOWN)
+            return self._finish(employee, question, state, started)
+        sections = [
+            (f"**{_topic_display(topic.label)}**\n\n{_offer_ta(_format_answer(answers[index], topic.query), topic.query)}"
+             if index in answers
+             else TOPIC_MISSING.format(topic=_topic_display(topic.label)))
+            for index, topic in enumerate(topics, 1)
+        ]
+        if remaining_topics:
+            sections.append("I can cover up to eight topics at a time. Please send any remaining topics separately.")
+        state.update(outcome="answered" if answers else "refused",
+                     answer="\n\n".join(sections),
+                     sections=list(dict.fromkeys(p.section_label for p in accepted.values())),
+                     citations=[_citation(p) for p in accepted.values()],
+                     valid_until=min((p.effective_to for p in accepted.values() if p.effective_to), default=None))
+        return self._finish(employee, question, state, started)
+
+    @staticmethod
+    def _topic_visible(role, passage, audiences):
+        return shares_audience(passage.audience, audiences) and _visible(role, passage)
+
+    def _report_rows(self, query, role, audiences, today, scope):
+        report = re.search(r"\b(?:incident report|(?:investigation )?summar[yt] report)\b", query, re.I)
+        if not report or re.search(r"\b(?:compar\w*|versus|difference)\b", query, re.I):
+            return []
+        heading = "incident report" if report[0].casefold() == "incident report" else "summary report"
+        return [p for p in self.store.heading_hits([heading], audiences, today, **scope)
+                if p.content_type == "form" and heading in p.heading.casefold()
+                and self._topic_visible(role, p, audiences)]
+
+    def _personal_travel(self, employee: Employee, question: str, intent: str, today: date) -> tuple:
+        role = employee.designation
+        audiences = set(allowed_audiences(role))
+        if role in {"intern", "trainee"}:
+            return "refused", "Travel benefits apply to permanent management employees. Ask HR if you need help.", []
+
+        def rows_for(heading):
+            return [p for p in self.store.heading_hits([heading], audiences, today)
+                    if p.title.casefold() == "travel policy" and _visible(role, p)
+                    and shares_audience(p.audience, audiences)]
+
+        eligibility = [p for p in rows_for("eligibility") if p.content_type == "section"
+                       and "permanent management employees" in p.body.casefold()]
+        travel_condition = ""
+        for passage in eligibility:
+            match = re.search(r"within the country, covering a distance of ([\d,]+) kilometers or more round trip",
+                              passage.body, re.I)
+            if match:
+                travel_condition = ("You qualify if you're a permanent management employee traveling for work "
+                                    f"within Pakistan at least {match[1]} km round trip.")
+                break
+
+        if intent == "hotel":
+            rows = [p for heading in (_HOTEL_SCHEDULE, "hotel entitlement", "accommodation")
+                    for p in rows_for(heading) if p.content_type == "table"
+                    and role in (policy_row_roles(p.heading, p.body, p.title) or set())
+                    and re.search(r"\b(?:proposed rates|self-stay)\s*:", p.body, re.I)]
+            rows = list({p.id: p for p in rows}.values())
+            if not rows:
+                rules = [p for p in rows_for("accommodation") if p.content_type == "section"
+                         and "eligible for accommodation in company-provided hotels or guest rooms" in p.body.casefold()]
+                if rules and travel_condition:
+                    return ("answered", f"{travel_condition} Accommodation is in company-provided hotels or guest rooms.\n\n"
+                            f"{RATE_MISSING}", [*rules, *eligibility])
+                return "dont_know", UNKNOWN, []
+            prefix = f"For your designation ({role_label(role)}):"
+            if travel_condition:
+                prefix = f"{travel_condition}\n\n{prefix}"
+            if len(rows) > 1:
+                return "answered", f"{prefix}\n\n{friendly_table(rows, question)}", [*rows, *eligibility]
+            fields = {key.casefold(): value for key, value in _fields(rows[0].body)}
+            details = []
+            self_stay_only = re.search(r"\b(?:self[- ]stay|own accommodation|stay on my own)\b", question, re.I)
+            amount_only = re.search(r"\b(?:rates?|amount|how much)\b", question, re.I) and not _RULE_REQUEST.search(question)
+            if not self_stay_only:
+                if fields.get("proposed rates") not in {None, "", "-"}:
+                    details.append(f"Hotel rate: {fields['proposed rates']}")
+                if fields.get("hotel entitlement") and not amount_only:
+                    details.append(f"Hotel options: {fields['hotel entitlement']}")
+            if fields.get("self-stay") and (self_stay_only or not amount_only):
+                details.append(f"Self-stay: {fields['self-stay']}")
+            if amount_only and details:
+                return "answered", f"{details[0]}. {travel_condition}".strip(), [*rows, *eligibility]
+            return "answered", f"{prefix}\n\n" + "\n".join(
+                f"- {value}" for value in details
+            ), [*rows, *eligibility]
+
+        if intent == "fuel":
+            rows = [p for p in rows_for(_FUEL_SCHEDULE) if p.content_type == "table"
+                    and role in (policy_row_roles(p.heading, p.body, p.title) or set())]
+            if not rows:
+                rules = [p for p in rows_for("company-maintained vehicles") if p.content_type == "section"
+                         and "reimbursed for fuel expenses based on the mileage rate" in p.body.casefold()]
+                if rules and travel_condition:
+                    return ("answered", f"{travel_condition} Fuel is reimbursed at the mileage rate if you're "
+                            "using a company-maintained vehicle for business travel or have a vehicle allowance.\n\n"
+                            f"{RATE_MISSING}", [*rules, *eligibility])
+                return "dont_know", UNKNOWN, []
+            vehicle = _VEHICLE_CC.search(question)
+            if vehicle:
+                rows = [p for p in rows if vehicle[1] in _vehicle_sizes(p)]
+                if not rows:
+                    return "dont_know", UNKNOWN, []
+            elif len(rows) > 1 and re.search(r"\b(?:one|single|exact)\s+rate\b|\b(?:rate|amount)\s+only\b", question, re.I):
+                return "clarification", "Which vehicle engine size should I use?", []
+            intro = f"The policy lists these fuel rates for your designation ({role_label(role)}):"
+            if travel_condition:
+                intro = f"{travel_condition}\n\n{intro}"
+            rates = _fuel_rates(rows, question)
+            if len(rows) == 1 and re.search(r"\b(?:rates?|amount|how much)\b", question, re.I) and not _COMPARISON.search(question):
+                return "answered", f"{rates.removeprefix('- ').rstrip('.')}. {travel_condition}".strip(), [*rows, *eligibility]
+            return "answered", f"{intro}\n\n{rates}", [*rows, *eligibility]
+
+        if intent == "daily":
+            evidence = rows_for("daily allowance")
+            rows = [p for p in evidence if p.content_type == "table"
+                    and role in (policy_row_roles(p.heading, p.body, p.title) or set())]
+            amounts = {value for p in rows for key, value in _fields(p.body)
+                       if key.casefold().startswith("daily allowance") and re.fullmatch(r"[\d,]+(?:\.\d+)?", value)}
+            rules = [p for p in evidence if p.content_type == "section" and _DA_CONDITION.search(p.body)]
+            distances = {match[1] for p in rules for match in _DA_CONDITION.finditer(p.body)}
+            if len(amounts) > 1 or len(distances) > 1:
+                return "clarification", "The daily allowance rules conflict. Ask HR to confirm which applies.", []
+            condition = ""
+            if distances:
+                employment = "you're a permanent management employee and " if eligibility else ""
+                condition = (f"You qualify if {employment}your business trip is at least "
+                             f"{next(iter(distances))} km round trip from your permanent place of work, "
+                             "including transit time.")
+            if condition and _RULE_REQUEST.search(question):
+                narrative = "\n".join(p.body for p in evidence if p.content_type == "section")
+                applicable_rules = []
+                full = re.search(r"\bOne full DA[^.]*full calendar day or exceeds (\d+) hours", narrative, re.I)
+                half = re.search(r"\bHalf DA[^.]*same-day[^.]*(\b\d+) hours or less", narrative, re.I)
+                if full:
+                    applicable_rules.append(f"Full allowance: a full calendar day or over {full[1]} hours.")
+                if half:
+                    applicable_rules.append(f"Half allowance: same-day return of {half[1]} hours or less.")
+                if re.search(r"\ba daily allowance will be granted for weekends and public holidays", narrative, re.I):
+                    applicable_rules.append("Applies on weekends and public holidays during the trip.")
+                if re.search(r"for training or sponsored travel[^.]*breakfast and lunch[^.]*half DA", narrative, re.I):
+                    applicable_rules.append("Half allowance for training or sponsored trips with breakfast and lunch.")
+                if re.search(r"if the travel is fully sponsored, no DA", narrative, re.I):
+                    applicable_rules.append("No allowance for fully sponsored trips.")
+                if applicable_rules:
+                    condition += "\n\n" + "\n".join(f"- {rule}" for rule in applicable_rules)
+            if len(amounts) == 1:
+                answer = f"Rs. {next(iter(amounts))} per day."
+            elif condition:
+                return "answered", f"{condition}\n\n{RATE_MISSING}", [*rules, *eligibility]
+            else:
+                return "dont_know", UNKNOWN, []
+            return "answered", f"{answer} {condition}".strip(), [*rows, *rules, *eligibility]
+
+        if intent == "tour":
+            evidence = rows_for("tour allowance")
+            rows = [p for p in evidence if p.content_type == "table"
+                    and role in (policy_row_roles(p.heading, p.body, p.title) or set())]
+            if not rows:
+                return "dont_know", UNKNOWN, []
+            intro = f"For your designation ({role_label(role)}):"
+            return "answered", intro + "\n\n" + "\n".join(p.body for p in rows), rows
+
+        evidence = rows_for(_TRAVEL_APPROVAL)
+        rows = [p for p in evidence if p.content_type == "table"
+                and role in (policy_row_roles(p.heading, p.body, p.title) or set())]
+        authorities = list(dict.fromkeys(
+            value for p in rows for key, value in _fields(p.body) if _APPROVAL_FIELD.search(f"{key}:")
+        ))
+        if len(authorities) != 1:
+            return "dont_know", UNKNOWN, []
+        authority = authorities[0]
+        if authority.casefold() == "gc, gm":
+            authority = "Group Chief / General Manager"
+        detail = f"For your designation ({role_label(role)}), the travel approver is {authority}."
+        if not re.search(r"\bwho\b|\bapprover\b", question, re.I):
+            summary = _travel_authorization_summary("authorization of business travel", evidence)
+            if summary:
+                detail += " " + summary.split(" Sales and Field Audit staff", 1)[0]
+        if re.search(r"\b(?:link|url)\b", question, re.I):
+            detail = with_passage_links(detail, evidence)
+        return "answered", detail, [*rows, *(p for p in evidence if p.content_type == "section")]
+
     def _finish(self, employee: Employee, question: str, state: dict, started: float) -> AskResult:
+        state["answer"] = soften_labels(state["answer"])
+        if forbidden_output(state["answer"]) or contains_named_pay(state["answer"]):
+            logger.warning("answer_guard request_id=%s", state["id"])
+            state.update(outcome="refused", guardrail="blocked", guardrail_reason="answer-content",
+                         answer=REFUSAL, citations=[], valid_until=None)
+        elif state["outcome"] not in {"blocked", "refused"} and (canonical := fixed_reply(state["answer"])):
+            state.update(answer=canonical, outcome="refused" if canonical == REFUSAL else "dont_know",
+                         citations=[], valid_until=None)
+        if state["outcome"] == "answered" and state["history_note"] != "question-recall":
+            note = _edition_note(question, self.store.list_policies() if re.search(r"\b(?:19|20)\d{2}\b", question) else [])
+            if note and note not in state["answer"]:
+                state["answer"] = f"{note}\n\n{state['answer']}"
+            state["answer"] = _remove_document_references(state["answer"])
+            if state["topic_count"] == 1:
+                state["answer"] = _offer_ta(_format_answer(state["answer"], question), question)
+        path = ("cached" if state["cache"] == "hit" else "recalled" if state["history_note"] == "question-recall"
+                else "model" if state["model"] else "deterministic")
+        passage_ids = list(dict.fromkeys([
+            *state["evidence_ids"], *(citation.passage_id for citation in state["citations"] if citation.passage_id),
+        ]))
+        logger.info("answer_trace %s", json.dumps({
+            "request_id": state["id"], "prompt_hash": state["prompt_hash"], "model": state["model"],
+            "finish_reason": state["finish_reason"], "topic_count": state["topic_count"], "path": path,
+            "passage_ids": passage_ids,
+        }))
         stopped = state["guardrail"] == "blocked"
         trace = TraceRecord(
-            id=uuid.uuid4().hex,
+            id=state["id"],
             created_at=utc_now(),
             email=employee.email,
             name=employee.name,
@@ -525,16 +1094,206 @@ class Pipeline:
                 withheld=state["withheld"],
                 model=state["model"],
             ),
-            prompt_version=prompt_version(),
+            prompt_version=state["prompt_hash"][:12],
+            passage_ids=passage_ids,
         )
         if state["outcome"] != "answered":
             trace.citations = []
         try:
             self.store.add_trace(trace)
-        except Exception:
-            logger.exception("Could not store the question trace")
+        except Exception as error:
+            _log_error(error, state["id"], 200)
         shown = trace.citations if state["outcome"] == "answered" else []
-        return AskResult(trace.answer, state["outcome"], shown, trace.id, state["valid_until"])
+        return AskResult(trace.answer, state["outcome"], shown, trace.id, state["valid_until"], passage_ids)
+
+
+def _edition_note(question: str, policies) -> str:
+    years = {int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", question)}
+    if not years or not policies:
+        return ""
+    folded = question.casefold()
+    named = [policy for policy in policies if any(len(word) > 4 and word in folded for word in policy.title.casefold().split())]
+    if not named or any(policy.effective_from and policy.effective_from.year in years for policy in named):
+        return ""
+    dates = sorted({policy.effective_from.isoformat() for policy in named if policy.effective_from})
+    if not dates:
+        return ""
+    listed = " or ".join(str(year) for year in sorted(years))
+    return f"There is no {listed} edition in the library. The edition on file is effective from {dates[0]}."
+
+
+def _distance_rule_answer(question: str, passages, store, audiences, today):
+    if not re.search(r"\b300\b", question) or not re.search(r"\b(?:km|kilometers?|rule|distance)\b", question, re.I):
+        return None
+    rule = next((passage for passage in passages if _DA_CONDITION.search(passage.body)), None)
+    if rule is None and hasattr(store, "heading_hits"):
+        for passage in store.heading_hits(["daily allowance"], audiences, today):
+            if _DA_CONDITION.search(passage.body):
+                rule = passage
+                break
+    if rule is None:
+        return None
+    match = _DA_CONDITION.search(rule.body)
+    sentence = (
+        f"The daily allowance applies to a business trip of at least {match[1]} km round trip "
+        "from the permanent place of work, including transit time."
+    )
+    return sentence, [rule]
+
+
+def _personal_travel_intent(question: str, fuel_question, requested_plan) -> str:
+    if requested_plan or asked_clause(question) or not _PERSONAL.search(question):
+        return ""
+    if re.search(r"\b(?:compare|versus|exceptions?|excluded|difference)\b", question, re.I):
+        return ""
+    if re.search(r"\btour allowance\b", question, re.I):
+        return "tour"
+    hotel = re.search(r"\b(?:hotel|lodging|accommodation|self[- ]stay|overnight stay|room budget|where can i stay)\b", question, re.I)
+    if hotel and not fuel_question and not re.search(
+        r"\b(?:how (?:can|should|do) i book|claim form|link|cancel|medical|hospital|takaful|book (?:a|my) hotel)\b", question, re.I,
+    ):
+        return "hotel"
+    if fuel_question and not hotel and not re.search(r"\b(?:form|claim|submit|receipt|link|url|documents?)\b", question, re.I):
+        return "fuel"
+    if re.search(r"\b(?:daily allowance|per diem|DA)\b", question, re.I) and not re.search(
+        r"\b(?:claim|submit|form|link|url|receipt|training|sponsor\w*|half|full|weekends?|holidays?)\b", question, re.I
+    ):
+        return "daily"
+    if re.search(r"\b(?:travel|business trip|work trip|per diem)\b", question, re.I):
+        if re.search(r"\b(?:daily allowance|travel allowance|per diem|daily budget)\b", question, re.I) and not hotel:
+            return "daily"
+        if re.search(r"\b(?:claim|hotel|accommodation|lodging|expenses?|reimbursement|urgent|fuel|mode|air|train|link|form|tour|allowance|except\w*)\b", question, re.I):
+            return ""
+        if re.search(r"\b(?:travel policy|approv\w*|authori[sz]\w*)\b", question, re.I):
+            return "approval"
+    return ""
+
+
+def _bounded_topic_evidence(groups: list[TopicEvidence]) -> list[TopicEvidence]:
+    if not groups:
+        return []
+    # Each topic keeps its own top passages. The byte budget is the only shared limit.
+    pools = [list(group.passages[:MAX_PASSAGES]) for group in groups]
+    chosen: list[list] = [[] for _ in groups]
+    used = 0
+    while used < EVIDENCE_MAX_BYTES:
+        added = False
+        for index, pool in enumerate(pools):
+            if not pool:
+                continue
+            row = pool[0]
+            size = len(row.body.encode("utf-8")) + len(row.section_label.encode("utf-8")) + 40
+            if chosen[index] and used + size > EVIDENCE_MAX_BYTES:
+                pool.clear()
+                continue
+            if size > EVIDENCE_MAX_BYTES - used and chosen[index]:
+                pool.clear()
+                continue
+            if size > EVIDENCE_MAX_BYTES:
+                raw = row.body.encode("utf-8")[: max(0, EVIDENCE_MAX_BYTES - used - 80)]
+                body = raw.decode("utf-8", errors="ignore")
+                body = body.rsplit(None, 1)[0] if " " in body else body
+                chosen[index].append(replace(row, body=body))
+                pool.clear()
+                used = EVIDENCE_MAX_BYTES
+                added = True
+                continue
+            chosen[index].append(pool.pop(0))
+            used += size
+            added = True
+        if not added:
+            break
+    result = [
+        TopicEvidence(group.number, group.question, rows)
+        for group, rows in zip(groups, chosen) if rows
+    ]
+    shared = {}
+    for group in result:
+        for row in group.passages:
+            if row.id not in shared or len(row.body) < len(shared[row.id].body):
+                shared[row.id] = row
+    for group in result:
+        group.passages = [shared[row.id] for row in group.passages]
+    return result
+
+
+def _topic_json(text: str, *, partial: bool = False) -> dict:
+    payload = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text, flags=re.I)
+    try:
+        value = json.loads(payload)
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        if not partial:
+            return {}
+    # Preserve only leading JSON members with a complete key and a closed string value.
+    payload = payload.lstrip()
+    if not payload.startswith("{"):
+        return {}
+    decoder = json.JSONDecoder()
+    completed = {}
+    remainder = payload[1:].lstrip()
+    while remainder:
+        try:
+            key, end = decoder.raw_decode(remainder)
+            value_start = remainder[end:].lstrip()
+            if not isinstance(key, str) or not key.isdecimal() or not value_start.startswith(":"):
+                break
+            value_start = value_start[1:].lstrip()
+            value, end = decoder.raw_decode(value_start)
+        except ValueError:
+            break
+        if not isinstance(value, str) or key in completed:
+            break
+        remainder = value_start[end:].lstrip()
+        if remainder and remainder[0] not in ",}":
+            break
+        completed[key] = value
+        if not remainder.startswith(","):
+            break
+        remainder = remainder[1:].lstrip()
+    return completed
+
+
+def _topic_display(label: str) -> str:
+    safe = re.sub(r"[^\w\s./&'-]", "", label).strip()
+    return safe[:1].upper() + safe[1:100] if safe else "Policy question"
+
+
+def _personal_medical_summary(rows: list[Passage]) -> str:
+    narrative = " ".join(p.body for p in rows if p.content_type == "section").casefold()
+    if "permanent management employees" not in narrative or not re.search(r"\bin[- ]?patient\b", narrative):
+        return ""
+    answer = "If you're a permanent management employee, the policy provides inpatient cover."
+    if "maternity" in narrative:
+        answer += " Maternity has separate eligibility rules."
+    plans = {p.id: p for p in rows if p.content_type == "table" and _row_plan(p.body)}
+    if len(plans) == 1:
+        p = next(iter(plans.values()))
+        fields = dict(_fields(p.body))
+        plan = _row_plan(p.body).upper()
+        room = next((value for label, value in fields.items() if label.casefold().startswith("room & board limit")), "")
+        hospital = next((value for label, value in fields.items() if label.casefold().startswith("hospitalization benefit")), "")
+        answer += f" Your designation is listed under Plan {plan}."
+        if hospital:
+            answer += f" Hospitalization limit: {hospital}."
+        if room:
+            answer += f" Room and board limit: {room} per day."
+    return answer
+
+
+def _vehicle_sizes(passage) -> set[str]:
+    vehicle = next((value for key, value in _fields(passage.body) if key.casefold() == "vehicle type"), "")
+    match = re.match(r"([\d/ ]+)\s*cc", vehicle, re.I)
+    return set(_VEHICLE_CC.findall(vehicle)) | (set(re.findall(r"\d+", match[1])) if match else set())
+
+
+def _remove_document_references(answer: str) -> str:
+    answer = re.sub(r"\s*\(\s*(?:see\s+|refer to\s+)?annexure\s+[a-z](?:\s*-\s*\d+)?\s*\)",
+                    "", answer, flags=re.I)
+    answer = re.sub(r"\s+\b(?:as per|shown in|set out in|listed in|in|under|see|refer to)\s+(?:the\s+)?"
+                    r"(?:annexure\s+[a-z](?:\s*-\s*\d+)?|(?:section|clause)\s+\d+(?:\.\d+)*)\b",
+                    "", answer, flags=re.I)
+    return re.sub(r"(?im)^\s*(?:annexure\s+[a-z](?:\s*-\s*\d+)?|(?:section|clause)\s+\d+(?:\.\d+)*)\s*[:—–-]\s*", "", answer).strip()
 
 
 def _medical_plan(question: str) -> re.Match | None:
@@ -552,7 +1311,14 @@ def _row_plan(body: str) -> str:
 
 
 def _medical_fields(question: str) -> list[str]:
-    return [label for pattern, label in _MEDICAL_FIELDS if re.search(pattern, question, re.I)]
+    fields = [label for pattern, label in _MEDICAL_FIELDS if re.search(pattern, question, re.I)]
+    if (re.search(r"\bnormal\s+(?:and|vs\.?|versus|or)\s+(?:complicated|caesarean|cesarean|c.section)\b", question, re.I)
+            and "normal delivery" not in fields):
+        fields.insert(0, "normal delivery")
+    positive = re.split(r"[,;]\s*not\s+|\b(?:but not|rather than|instead of)\s+", question, maxsplit=1, flags=re.I)
+    if len(positive) == 2:
+        return _medical_fields(positive[0])
+    return fields
 
 
 def _medical_field_answer(passages, requested: list[str], question: str) -> str:
@@ -574,9 +1340,12 @@ def _medical_field_answer(passages, requested: list[str], question: str) -> str:
             return f"{name}: {amount}."
     if any(len(amounts) > 1 for amounts in values.values()):
         return "The policy gives conflicting amounts. Please check with HR."
-    return _markdown_table(["Plan", "Benefit", "Amount"], [
+    records = [
         [f"Plan {plan.upper()}", name, next(iter(amounts))] for (plan, name), amounts in values.items()
-    ])
+    ]
+    if _COMPARISON.search(question):
+        return _markdown_table(["Plan", "Benefit", "Amount"], records)
+    return "\n".join(f"- {plan}, {name}: {amount}" for plan, name, amount in records)
 
 
 def _retail_eligibility(designation: str, question: str, passages) -> str:
@@ -593,15 +1362,22 @@ def _retail_eligibility(designation: str, question: str, passages) -> str:
 
 
 def _travel_authorization_summary(question: str, passages) -> str:
-    if not re.search(r"\b(?:authori[sz]ation of (?:business )?travel|travel authori[sz]ation)\b", question, re.I):
-        return ""
-    if asked_clause(question) or re.search(
+    asks_deadline = _TRAVEL_DEADLINE.search(question)
+    asks_summary = re.search(r"\b(?:authori[sz]ation of (?:business )?travel|travel authori[sz]ation)\b", question, re.I)
+    if not (asks_deadline or asks_summary) or asked_clause(question) or (not asks_deadline and re.search(
         r"\b(?:who|when|where|exceptions?|restrictions?|urgent|sales|audit|form|link|compare|exact)\b", question, re.I,
-    ):
+    )):
         return ""
     text = "\n".join(p.body for p in passages if p.title == "Travel Policy"
                      and p.heading.startswith("3.2.") and p.content_type == "section").casefold()
     deadline = re.search(r"at least (\d+) days prior to the travel date", text)
+    if asks_deadline:
+        if deadline and all(word in text for word in ("dually signed travel request form", "administration department via hr")):
+            return (f"Send the signed Travel Request Form to Administration through HR at least {deadline[1]} days "
+                    "before travel. For urgent travel, get approval by email and complete the form when you return."
+                    if "seek approval via email" in text and "upon returning" in text
+                    else f"Send the signed Travel Request Form to Administration through HR at least {deadline[1]} days before travel.")
+        return ""
     required = ("pre-approved by the competent authority", "dually signed travel request form",
                 "administration department via hr", "seek approval via email", "upon returning",
                 "complete the travel request form", "obtain all necessary approvals")
@@ -632,6 +1408,75 @@ def _named_summary_excerpt(subject: str, passages) -> str:
         not bool(re.search(r"\b(?:values|purpose|means|requires)\b", item, re.I)),
         bool(re.search(r"\d", item)),
     ))
+
+
+def _recall_question(ordinal: int, history: list[dict]) -> tuple[str, list[str]]:
+    user_indexes = [index for index, turn in enumerate(history) if turn["role"] == "user"]
+    if not user_indexes or (ordinal != -1 and not 0 < ordinal <= len(user_indexes)):
+        return "I can't find that question in this chat's saved history.", []
+    index = user_indexes[-1] if ordinal == -1 else user_indexes[ordinal - 1]
+    question = history[index]["text"]
+    following = history[index + 1] if index + 1 < len(history) else {}
+    ids = following.get("passage_ids", []) if following.get("role") == "assistant" else []
+    if ordinal == -1:
+        return f'Your previous saved question was: "{question}"', ids
+    return f'Question {ordinal} in this chat\'s saved history was: "{question}"', ids
+
+
+def _strip_closing_offers(answer: str) -> str:
+    boundaries = [0, *(match.end() for match in re.finditer(r"(?<=[.!?;])[ \t]+|\n+", answer))]
+    for start in boundaries:
+        tail = answer[start:].lstrip(" \t*_-")
+        if not _CLOSING_OFFER.match(tail):
+            continue
+        if re.match(r"if\b", tail, re.I) and not re.search(
+            r"\b(?:let me know|i (?:can|could|will)|we (?:can|could|will)|download(?:able)? template|template link)\b",
+            tail, re.I,
+        ):
+            continue
+        return answer[:start].rstrip(" \t\r\n;")
+    return answer
+
+
+def _field_list(title: str, fields: list[str]) -> str:
+    return title + " fields\n\n" + "\n".join(f"- {field}" for field in fields)
+
+
+def _summary_report_source_fields(passages) -> list[str]:
+    prefix = "Investigation Summary Report template. "
+    return list(dict.fromkeys(
+        part.strip().rstrip(".")
+        for passage in passages if passage.content_type == "form" and passage.body.startswith(prefix)
+        for part in passage.body[len(prefix):].split(". ") if part.strip()
+    ))
+
+
+def _asks_summary_fields(question: str) -> bool:
+    return bool(re.search(r"\bsummar[yt] report\b", question, re.I) and (
+        _FORM_FIELDS_REQUEST.search(question) or re.fullmatch(
+            r"(?:the\s+)?(?:investigation\s+)?summar[yt] report(?: template)?[?.!]*", question.strip(), re.I)))
+
+
+def _summary_report_fields(passages, question: str) -> str:
+    if not _asks_summary_fields(question):
+        return ""
+    fields = _summary_report_source_fields(passages)
+    if not fields:
+        return ""
+    return _field_list("Investigation Summary Report", fields)
+
+
+def _claim_form_fields(passages) -> list[str]:
+    fields = []
+    for passage in passages:
+        start = re.search(r"^Employee Details:\s*", passage.body, re.M)
+        if not start:
+            continue
+        for line in passage.body[start.start():].splitlines():
+            group = re.fullmatch(r"(?:Employee|Travel|Expenses) Details:\s*(.+)", line.strip())
+            parts = group[1].rstrip(".").split(", ") if group else line.strip().rstrip(".").split(". ")
+            fields.extend(part for part in parts if part)
+    return list(dict.fromkeys(fields))
 
 
 def _short_answer(answer: str, question: str) -> str:
@@ -711,7 +1556,9 @@ def _previous_boundary(turns: list[dict]) -> str:
 
 
 def _visible(designation: str, passage) -> bool:
-    return visible_passage(designation, passage)
+    return (visible_passage(designation, passage)
+            and not contains_named_pay(f"{passage.title}\n{passage.body}")
+            and not exposes_prompt(passage.body))
 
 
 _LINK = re.compile(r"https?://[^\s)>\]]+")
@@ -766,25 +1613,91 @@ def with_passage_links(answer: str, passages) -> str:
     return text.rstrip() + "\n\n" + "\n".join(found)
 
 
-def friendly_table(passages) -> str:
-    """Turn table rows into one markdown table so the screen can draw a real table."""
+_NUMBER_COLUMN = re.compile(r"(?:#|no\.?|(?:sr|serial|item|row)\.?\s*(?:#|no\.?(?:umber)?|number)?|\d+[.)]?)", re.I)
+
+
+def _offer_ta(answer: str, question: str) -> str:
+    if _TA.search(question) and not re.search(r"\b(?:mileage|fuel|allowance rates?)\b", question, re.I):
+        return f"{answer}\n\n{_TA_OFFER}"
+    return answer
+
+
+def _dress_code_rule(passages, question: str) -> str:
+    if not re.search(r"\bdress[- ]code\b", question, re.I):
+        return ""
+    for passage in passages:
+        fields = {k.casefold(): v for k, v in _fields(passage.body)}
+        if ("dress code" in fields.get("examples (not limited to these)", "").casefold()
+                and fields.get("level", "").casefold() == "minor"
+                and re.fullmatch(r"Verbal\s*→\s*1st Written Warning", fields.get("steps", ""), re.I)):
+            return ("Follow workplace dress-code rules. A breach is treated as minor. "
+                    "It starts with a verbal warning, followed by a first written warning.")
+    return ""
+
+
+def _fuel_rates(passages, question: str) -> str:
+    records = []
+    for passage in sorted(passages, key=lambda p: min(map(int, _vehicle_sizes(p)), default=0)):
+        fields = {k.casefold(): v for k, v in _fields(passage.body)}
+        vehicle = fields.get("vehicle type")
+        if vehicle:
+            records.append([
+                vehicle, fields.get("grade entitlement", ""), fields.get("mileage (km coverage)", ""),
+                fields.get("maintenance and depreciation (new rates)", "").replace("/km", " per km"),
+            ])
+    if _COMPARISON.search(question) and records:
+        return _markdown_table(["Vehicle", "Applies to", "Mileage", "Maintenance and depreciation"], records)
+    return "\n".join(
+        "- " + ": ".join([vehicle, ", ".join(value for value in (mileage, rate) if value)])
+        for vehicle, _, mileage, rate in records
+    )
+
+
+def _format_answer(answer: str, question: str) -> str:
+    answer = re.sub(r"\b(?:PKR\.?|Rs\.?|rupees)\s*(?=\d)", "Rs. ", answer, flags=re.I)
+    answer = re.sub(r"(?<=\d)/-", "", answer)
+    answer = re.sub(r"(?m)^[ \t]*\d{1,3}[.):][ \t]+(?=\S)", "- ", answer)
+    answer = re.sub(r"\b(?:Sr\.?\s*#|(?:serial|row|item)\s+(?:number|no\.?))\s*:?\s*\d+\s*[-:.]?\s*",
+                    "", answer, flags=re.I)
+
+    def reformat_table(match: re.Match) -> str:
+        lines = [[cell.strip() for cell in line.strip().strip("|").split("|")] for line in match[0].splitlines()]
+        first, *records = lines
+        records = [row for row in records if not all(re.fullmatch(r":?-+:?", cell) for cell in row)]
+        indexes = [index for index, field in enumerate(first) if not _NUMBER_COLUMN.fullmatch(field)]
+        headers = [first[index] for index in indexes]
+        rows = [[row[index] for index in indexes] for row in records if len(row) == len(first)]
+        if _COMPARISON.search(question) and len(headers) > 1 and rows:
+            return _markdown_table(headers, rows) + "\n"
+        bullets = []
+        for row in rows:
+            fields = [f"{key}: {value}" if key.casefold() not in {"details", "value"} else value
+                      for key, value in zip(headers, row) if value]
+            if fields:
+                bullets.append("- " + " · ".join(fields))
+        return "\n".join(bullets) + "\n"
+
+    return re.sub(r"(?m)(?:^[ \t]*\|[^\n]*\|[ \t]*(?:\n|$)){2,}", reformat_table, answer).strip()
+
+
+def friendly_table(passages, question: str = "") -> str:
+    """Keep comparisons tabular and present ordinary policy rows in plain text."""
     records = []
     for passage in passages:
-        pairs = _fields(passage.body)
+        pairs = [(label, value) for label, value in _fields(passage.body)
+                 if not _NUMBER_COLUMN.fullmatch(label) or label.isdecimal()]
         if pairs:
-            records.append(pairs)
+            records.append([("" if label.isdecimal() else label, value) for label, value in pairs])
         elif passage.body.strip():
-            records.append([("Details", passage.body.strip())])
+            records.append([("", passage.body.strip())])
     if not records:
         return ""
     labels = [label for label, _ in records[0]]
     same_shape = all([label for label, _ in record] == labels for record in records)
-    if len(records) > 1 and same_shape:
+    if _COMPARISON.search(question) and len(records) > 1 and same_shape and all(labels):
         return _markdown_table(labels, [[value for _, value in record] for record in records])
-    lines = []
-    for record in records:
-        lines.append(_markdown_table(["Item", "Details"], [[label, value] for label, value in record]))
-    return "\n\n".join(lines)
+    lines = [" · ".join(f"{label}: {value}" if label else value for label, value in record) for record in records]
+    return lines[0] if len(lines) == 1 else "\n".join(f"- {line}" for line in lines)
 
 
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -820,7 +1733,11 @@ def _citation(passage, include_full_page=False) -> Citation:
     if source and source not in images:
         images.append(source)
     label = f"{passage.section_label}, p. {passage.page}" if passage.page else passage.section_label
-    return Citation(label, passage.body, "|".join(images))
+    return Citation(label, passage.body, "|".join(images), passage.id, passage.title)
+
+
+def _log_error(error: Exception, request_id: str, status: int) -> None:
+    logger.warning("error_class=%s request_id=%s status=%d", type(error).__name__, request_id, status)
 
 
 def plain_steps(

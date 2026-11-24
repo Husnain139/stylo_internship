@@ -95,6 +95,13 @@ def rewrite_question(question: str, history: list[dict]) -> Rewrite:
     follow = _FOLLOW.match(text)
     if follow and prior:
         topic = follow.group(1).strip()
+        travel_prior = re.search(
+            r"\b(?:daily allowance|fuel|mileage|hotel|lodging|travel allowance|tour allowance|DA|TA)\b",
+            prior,
+            re.I,
+        )
+        if travel_prior and re.search(r"\b(?:hotel|lodging|fuel|mileage|allowance)\b", topic, re.I):
+            return Rewrite(f"what is my {topic}", prior, "follow-up")
         shared = token_set(topic) & token_set(prior)
         if shared:
             return Rewrite(topic, prior, "follow-up")

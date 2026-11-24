@@ -43,6 +43,9 @@ CHUNK_OVERLAP = 400
 EVIDENCE_MAX_BYTES = 12000
 RETRIEVE_TOP_K = 6
 RETRIEVE_CANDIDATES = 20
+RRF_K = 60
+# Floor on the reranker score. 0 until the tuning set chooses it.
+RERANK_FLOOR = 0.0
 MIN_VECTOR_SCORE = 0.25
 HISTORY_TURNS = 6
 PASSAGE_SCORE_WINDOW = 0.12
@@ -50,8 +53,6 @@ MAX_PASSAGES = 4
 
 CANARY = "STYLO-PROMPT-DO-NOT-REPEAT"
 
-REFUSAL = "I can't answer that."
-UNKNOWN = "I couldn't find this in the policies I can open. Ask HR."
 TOO_LONG = "Please ask a shorter question."
 EMPTY_QUESTION = "Type a question first."
 UNAVAILABLE = "The assistant is not available right now. Try again in a moment."

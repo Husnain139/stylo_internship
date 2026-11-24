@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 
 from .access import grade_band
-from .config import CANARY, REFUSAL, UNKNOWN
+from .config import CANARY
+from .replies import REFUSAL, UNKNOWN
 
 _CHUNK = re.compile(
     r"\[/?chunk_[^\]]+\]|chunk_\d+_doc_\d+|\[doc_\d+\]|\bdoc_\d+\b",
@@ -18,6 +19,16 @@ _MONEY = re.compile(r"\b(?:rs\b|pkr\b|rupees?\b)", re.IGNORECASE)
 _ECHO = re.compile(
     r"^(source\b|effective\b|source line\b|if you want\b|if the passage\b|next,\s|we would add\b)",
     re.I,
+)
+_INTERNAL_WORDING = re.compile(
+    r"\b(?:your excerpt|the (?:passages?|excerpt|supplied policy)|what you provided|"
+    r"(?:provided|supplied) (?:excerpt|passages?|policy text)|(?:policy text|excerpt|passages?) (?:provided|supplied)|"
+    r"(?:provide|confirm|share)(?:\s+or\s+(?:confirm|share))?\s+(?:the\s+)?(?:policy text|rates?|amounts?)|"
+    r"system prompt|verified employee designation)\b", re.I,
+)
+_FILE_PATH = re.compile(
+    r"(?i)(?<![\w/])(?:file:\s*//|[a-z]:[\\/]|\\\\[\w.-]+\\|"
+    r"/[\w.-]+(?:/[\w.-]+)+|(?:\.\.?[\\/])?[\w.-]+[\\/][\w.-]+\.(?:pdf|docx?|xlsx?|md|py|json|txt)\b)"
 )
 
 
@@ -38,11 +49,44 @@ def _numbers(text: str) -> set[str]:
     return {token.replace(",", "") for token in _NUMBER.findall(text)}
 
 
+def exposes_prompt(text: str) -> bool:
+    folded = text.casefold()
+    return CANARY.casefold() in folded or "internal marker" in folded or bool(re.search(r"{{[^{}]+}}", text))
+
+
+_ANNEXURE_LABEL = re.compile(r"\bannexures?\s+[a-z0-9]+\b", re.I)
+_ANNEXURE_WORD = re.compile(r"\bannexures?\b", re.I)
+
+
+def soften_labels(text: str) -> str:
+    """Drop an annexure label and keep the sentence. The canary and other bans stay."""
+    cleaned = _ANNEXURE_WORD.sub("", _ANNEXURE_LABEL.sub("", text or ""))
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+def forbidden_output(text: str) -> bool:
+    return (exposes_prompt(text) or bool(_INTERNAL_WORDING.search(text))
+            or bool(_FILE_PATH.search(_URL.sub("", text))))
+
+
+def fixed_reply(answer: str) -> str:
+    plain = answer.strip(" \r\n\t.!*").replace("’", "'").casefold()
+    if plain.startswith("i can't answer") and REFUSAL.casefold().startswith(plain):
+        return REFUSAL
+    if ((plain.startswith("i couldn't find this") and UNKNOWN.casefold().startswith(plain))
+            or re.fullmatch(r"(?:[^:\n]+:\s+)?i couldn't find this(?:\.\s+ask(?: hr)?)?", plain)):
+        return UNKNOWN
+    return ""
+
+
 def sanitize(answer: str, passage_texts: list[str], allowed_numbers_from: str = "") -> str:
+    answer = soften_labels(answer)
     if not answer or not answer.strip():
         return UNKNOWN
-    if CANARY in answer or "Internal marker" in answer:
+    if forbidden_output(answer):
         return REFUSAL
+    if fixed := fixed_reply(answer):
+        return fixed
     allowed_urls = _allowed_urls(passage_texts)
 
     def replace_url(match: re.Match[str]) -> str:
@@ -59,6 +103,10 @@ def sanitize(answer: str, passage_texts: list[str], allowed_numbers_from: str = 
     blank = False
     for raw_line in cleaned.replace("\r\n", "\n").split("\n"):
         stripped = raw_line.strip()
+        if canonical := fixed_reply(stripped):
+            if canonical == REFUSAL:
+                return REFUSAL
+            continue
         if not stripped:
             blank = True
             continue
@@ -70,6 +118,8 @@ def sanitize(answer: str, passage_texts: list[str], allowed_numbers_from: str = 
             body = bullet.group(1).strip()
         kept = []
         for sentence in _sentences(body):
+            if any(symbol in sentence and not any(symbol in source for source in passage_texts) for symbol in ("₹", "€", "£", "$")):
+                continue
             numbers = _numbers(sentence)
             if not numbers <= allowed_numbers:
                 continue
@@ -78,7 +128,7 @@ def sanitize(answer: str, passage_texts: list[str], allowed_numbers_from: str = 
                 if not any(numbers <= values and (grade is None or grade == band) for band, values in evidence):
                     continue
             letters = re.sub(r"[^A-Za-z0-9]", "", sentence)
-            if len(letters) < 8 or _ECHO.search(sentence):
+            if len(letters) < 8 or _ECHO.search(sentence) or _INTERNAL_WORDING.search(sentence):
                 continue
             kept.append(sentence)
         if not kept:
@@ -90,4 +140,4 @@ def sanitize(answer: str, passage_texts: list[str], allowed_numbers_from: str = 
     text = "\n".join(kept_lines)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\s+([.,!?])", r"\1", text).strip()
-    return text or UNKNOWN
+    return fixed_reply(text) or text or UNKNOWN

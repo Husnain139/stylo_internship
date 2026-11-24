@@ -37,6 +37,7 @@ export function AskScreen() {
   const questionId = useId();
   const helpId = useId();
   const errorId = useId();
+  const historyId = useId();
   const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
@@ -45,11 +46,18 @@ export function AskScreen() {
   const [limits, setLimits] = useState<ChatList | null>(null);
   const [hiddenMessages, setHiddenMessages] = useState(0);
   const [historyError, setHistoryError] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const request = useRef<AbortController | null>(null);
   const nextTurnId = useRef(0);
+  const threadEnd = useRef<HTMLDivElement | null>(null);
+  const composer = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (turns.length) threadEnd.current?.scrollIntoView({ block: "end" });
+  }, [turns, sending]);
 
   useEffect(() => {
     request.current?.abort();
@@ -61,6 +69,7 @@ export function AskScreen() {
     setQuestion("");
     setError("");
     setHistoryError("");
+    setHistoryOpen(false);
     if (!me) return;
     let active = true;
     api<ChatList>("/api/conversations")
@@ -86,6 +95,8 @@ export function AskScreen() {
       setHiddenMessages(result.hiddenMessages);
       setTurns(result.messages.map((item) => ({ ...item, id: ++nextTurnId.current })));
       setQuestion("");
+      setHistoryOpen(false);
+      composer.current?.focus({ preventScroll: true });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not open that chat.");
     } finally {
@@ -194,19 +205,33 @@ export function AskScreen() {
   }
 
   return (
-    <section className="stack employee-chat">
-      <header className="page-head">
+    <section className="chat-layout">
+      <button className="chat-history-toggle" type="button" aria-expanded={historyOpen} aria-controls={historyId}
+        onClick={() => setHistoryOpen((open) => !open)}>
+        {historyOpen ? "Hide chat history" : "Show chat history"}
+      </button>
+      <aside id={historyId} className={`chat-sidebar${historyOpen ? " is-open" : ""}`} aria-label="Chat history">
+        <button className="primary" type="button" disabled={busy} onClick={() => void openChat("")}>New chat</button>
+        <h2>Saved chats</h2>
+        {historyError ? <p className="banner" role="status">{historyError}</p> : null}
+        {!historyError && chats.length === 0 ? <p className="chat-sidebar-note">Your chats will appear here.</p> : null}
+        <ul className="chat-list">
+          {chats.map((chat) => (
+            <li key={chat.id}>
+              <button type="button" aria-current={chat.id === chatId ? "true" : undefined} disabled={busy}
+                onClick={() => void openChat(chat.id)} title={chat.title}>{chat.title}</button>
+            </li>
+          ))}
+        </ul>
+        {limits ? (
+          <details className="chat-details"><summary>Chat storage</summary>
+            <p>Up to {limits.messageLimit} messages per chat, kept for {limits.retentionDays} days after your last activity.</p>
+          </details>
+        ) : null}
+      </aside>
+      <div className="stack employee-chat">
+      <header className="page-head chat-heading">
         <h1>Ask about a policy</h1>
-      </header>
-      {historyError ? <p className="banner" role="status">{historyError}</p> : null}
-      {chats.length > 0 ? <div className="chat-toolbar">
-        <label htmlFor={`${questionId}-chats`}>Saved chats</label>
-        <select id={`${questionId}-chats`} value={chatId} disabled={busy}
-          onChange={(event) => void openChat(event.target.value)}>
-          <option value="">New chat</option>
-          {chats.map((chat) => <option key={chat.id} value={chat.id}>{chat.title}</option>)}
-        </select>
-        {chatId ? <button type="button" disabled={busy} onClick={() => void openChat("")}>New chat</button> : null}
         {chatId && !deleting ? <button type="button" disabled={busy} onClick={() => setDeleting(true)}>Delete chat</button> : null}
         {deleting ? (
           <div className="row-actions confirm" role="group" aria-label="Confirm chat deletion">
@@ -215,12 +240,8 @@ export function AskScreen() {
             <button type="button" disabled={busy} onClick={() => setDeleting(false)}>Cancel</button>
           </div>
         ) : null}
-      </div> : null}
-      {limits ? (
-        <details className="chat-details"><summary>Chat storage</summary>
-          <p>Up to {limits.messageLimit} messages per chat, kept for {limits.retentionDays} days after your last activity.</p>
-        </details>
-      ) : null}
+      </header>
+      <div className="chat-transcript">
       {hiddenMessages > 0 ? (
         <p className="banner" role="status">Earlier messages were hidden after a policy or access change.</p>
       ) : null}
@@ -251,6 +272,9 @@ export function AskScreen() {
           ) : null}
         </ol>
       ) : null}
+      <div ref={threadEnd} />
+      </div>
+      <div className="chat-composer">
       <form
         className="ask-form"
         aria-busy={busy}
@@ -262,6 +286,7 @@ export function AskScreen() {
         <div className="field">
           <label htmlFor={questionId}>Your question</label>
           <textarea
+            ref={composer}
             id={questionId}
             name="question"
             value={question}
@@ -299,7 +324,7 @@ export function AskScreen() {
         <div className="suggestions">
           <h2>Try asking</h2>
           <ul className="people">
-            {[...GENERAL_SUGGESTIONS, ...(ADDITIONAL_SUGGESTIONS[me.designation] || [])].map((item) => (
+            {[...GENERAL_SUGGESTIONS, ...(ADDITIONAL_SUGGESTIONS[me.designation] || []), "What is my fuel entitlement?"].map((item) => (
               <li key={item}>
                 <button type="button" disabled={busy} onClick={() => void submit(item)}>
                   {item}
@@ -309,6 +334,8 @@ export function AskScreen() {
           </ul>
         </div>
       ) : null}
+      </div>
+      </div>
     </section>
   );
 }
@@ -340,6 +367,9 @@ function Formatted({ text, labels = [] }: { text: string; labels?: string[] }) {
   return (
     <div className="answer-copy">
       {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          return <h2 className="answer-topic" key={`heading-${index}`}>{block.text}</h2>;
+        }
         if (block.type === "table") {
           return (
             <div className="table-wrap" key={`table-${index}`}>

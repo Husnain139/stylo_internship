@@ -878,7 +878,8 @@ class PostgresStore(PostgresOperations):
 
     def get_trace(self, trace_id: str) -> TraceRecord | None:
         with self._lock, self.conn.cursor() as cur:
-            cur.execute("SELECT payload FROM traces WHERE id = %s", (trace_id,))
+            cur.execute("SELECT payload FROM traces WHERE id = %s AND created_at >= now() - interval '3 months'",
+                        (trace_id,))
             row = cur.fetchone()
         if not row:
             return None
@@ -956,10 +957,11 @@ def _trace_payload(trace: TraceRecord) -> dict:
         "outcome": trace.outcome,
         "answer": trace.answer,
         "citations": [
-            {"label": item.label, "text": item.text, "image": item.image} for item in trace.citations
+            {"label": item.label, "passage_id": item.passage_id, "title": item.title} for item in trace.citations
         ],
         "steps": trace.steps,
         "prompt_version": trace.prompt_version,
+        "passage_ids": trace.passage_ids,
     }
 
 
@@ -990,9 +992,10 @@ def _trace_from_payload(payload: dict) -> TraceRecord:
         outcome=payload.get("outcome") or "",
         answer=payload.get("answer") or "",
         citations=[
-            Citation(item["label"], item["text"], item.get("image") or "")
+            Citation(item["label"], "", passage_id=item.get("passage_id") or "", title=item.get("title") or "")
             for item in payload.get("citations") or []
         ],
         steps=payload.get("steps") or [],
         prompt_version=payload.get("prompt_version") or "",
+        passage_ids=payload.get("passage_ids") or [],
     )

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 from .config import (
     MAX_PASSAGES,
     MIN_VECTOR_SCORE,
     PASSAGE_SCORE_WINDOW,
+    RERANK_FLOOR,
     RETRIEVE_CANDIDATES,
     RETRIEVE_TOP_K,
+    RRF_K,
 )
 from .clauses import asked_clause, asked_page, contains_clause, heading_has_phrase, heading_phrases
 from .models import Passage
@@ -59,25 +62,41 @@ def search_passages(
     words = token_set(query)
     negative = bool(words & _NEGATIVE)
     asks_for_form = bool(words & {"template", "form", "details"})
+    heading_order = [passage.id for passage in raw if _names_this(passage, phrases, page_number)]
+    if number:
+        heading_order.extend(
+            passage.id for passage in raw
+            if contains_clause(f"{passage.heading}\n{passage.body}", number) and passage.id not in heading_order
+        )
+    for passage in raw:
+        # The document title sits in section_label. Score the heading path and the body apart from it.
+        passage.heading_kw = keyword_score(query, f"{passage.heading_path} {passage.heading}")
+        passage.body_kw = keyword_score(query, passage.body)
+        passage.kw_score = max(passage.heading_kw, passage.body_kw)
+        passage.typo_match = _typo_match(query, f"{passage.heading_path} {passage.heading} {passage.body}")
+    by_vector = sorted(raw, key=lambda passage: passage.vec_score, reverse=True)
+    by_keyword = sorted(raw, key=lambda passage: passage.kw_score, reverse=True)
+    vector_order = [passage.id for passage in by_vector if passage.vec_score > 0]
+    keyword_order = [passage.id for passage in by_keyword if passage.kw_score > 0]
+    rrf: dict[str, float] = {}
+    for order in (vector_order, keyword_order, heading_order):
+        for rank, passage_id in enumerate(order, start=1):
+            rrf[passage_id] = rrf.get(passage_id, 0.0) + 1.0 / (RRF_K + rank)
+    explicit = set(heading_order)
+    pool_ids = {passage.id for passage in sorted(raw, key=lambda item: rrf.get(item.id, 0.0), reverse=True)[:20]}
+    pool_ids.update(explicit)
     kept: list[Passage] = []
     for passage in raw:
-        haystack = f"{passage.section_label} {passage.heading_path} {passage.heading} {passage.body}"
-        passage.kw_score = keyword_score(query, haystack)
-        passage.typo_match = _typo_match(query, haystack)
-        passage.score = 0.65 * max(passage.vec_score, 0.0) + 0.35 * passage.kw_score
+        if passage.id not in pool_ids:
+            continue
+        passage.score = _rerank(passage, rrf.get(passage.id, 0.0))
         if negative and passage.polarity == "exclusion":
-            passage.score += 0.2
+            passage.score += 0.02
         if asks_for_form and passage.content_type == "form":
-            passage.score += 0.15
-        named = _names_this(passage, phrases, page_number)
-        if number and contains_clause(f"{passage.heading}\n{passage.body}", number):
-            passage.kw_score = 1.0
-            passage.score = 0.65 * max(passage.vec_score, 0.0) + 0.85
-        elif named:
-            passage.kw_score = 1.0
-            passage.score = 0.65 * max(passage.vec_score, 0.0) + 0.85
-        if _keep(passage):
+            passage.score += 0.02
+        if passage.id in explicit or _keep(passage):
             kept.append(passage)
+    kept.sort(key=lambda passage: passage.score, reverse=True)
     def protected(passage: Passage) -> bool:
         if number and contains_clause(f"{passage.heading}\n{passage.body}", number):
             return True
@@ -107,14 +126,42 @@ def search_passages(
             top = max(passage.score for passage in merged)
             for passage in merged:
                 passage.score = top
-        return merged[:16]
+        return _with_distance_rule(store, query, merged[:16], audiences, today)
     if kept and kept[0].content_type == "table" and hasattr(store, "heading_rows"):
-        same = [passage for passage in kept if passage.heading == kept[0].heading]
-        if len(same) >= 3:
-            rows = store.heading_rows(kept[0].policy_id, kept[0].heading, audiences, today)
-            if len(rows) >= len(same):
-                return rows[:16]
-    return kept[:RETRIEVE_TOP_K]
+        rows = store.heading_rows(kept[0].policy_id, kept[0].heading, audiences, today)
+        if len(rows) > 1:
+            scores = {passage.id: passage.score for passage in kept}
+            rows.sort(key=lambda passage: scores.get(passage.id, 0.0), reverse=True)
+            for row in rows:
+                row.score = scores.get(row.id, 0.0)
+            kept = rows
+    if kept and kept[0].score < RERANK_FLOOR and not (named or on_page):
+        return []
+    limit = 16 if kept and kept[0].content_type == "table" and len(kept) > RETRIEVE_TOP_K else RETRIEVE_TOP_K
+    return _with_distance_rule(store, query, kept[:limit], audiences, today)
+
+
+def _rerank(passage: Passage, rrf: float) -> float:
+    """Order the fused candidates. A title-only passage loses to a real section."""
+    short = 0.04 if len(passage.body.encode("utf-8")) < 80 else 0.0
+    return rrf + 0.025 * passage.heading_kw + 0.01 * passage.body_kw - short
+
+
+def _with_distance_rule(store, query: str, passages: list[Passage], audiences: set[str], today: date) -> list[Passage]:
+    asked = bool(re.search(r"\b300\b", query) and re.search(r"\b(?:km|kilometers?|rule|allowance|distance)\b", query, re.I))
+    rate = any(re.search(r"daily allowance|fuel entitlement|hotel entitlement", passage.heading, re.I) for passage in passages)
+    if not asked and not rate:
+        return passages
+    if any(re.search(r"\b300\b", passage.body) and re.search(r"round trip", passage.body, re.I) for passage in passages):
+        return passages
+    if not hasattr(store, "heading_hits"):
+        return passages
+    for extra in store.heading_hits(["daily allowance"], audiences, today):
+        if re.search(r"\b300\b", extra.body) and re.search(r"round trip", extra.body, re.I):
+            if all(passage.id != extra.id for passage in passages):
+                return [*passages, extra]
+            break
+    return passages
 
 
 def _phrase_count(passage: Passage, phrases: list[str]) -> int:

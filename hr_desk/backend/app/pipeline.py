@@ -311,7 +311,7 @@ class Pipeline:
                 personal = "approval"
             personal_medical = bool(
                 not requested_plan and not reference and _PERSONAL.search(question)
-                and re.search(r"\b(?:medical|health insurance|medical cover|hospitali[sz]ation|hospital|takaful|maternity|delivery)\b", question, re.I)
+                and (medical_fields or re.search(r"\b(?:medical|health insurance|medical cover|hospitali[sz]ation|hospital|takaful|maternity|delivery)\b", question, re.I))
                 and not re.search(r"\b(?:claim|panel|form|submit|reimburse)\b", question, re.I)
             )
             personal_search = ""
@@ -320,7 +320,7 @@ class Pipeline:
                     and hasattr(self.llm, "personal_query")):
                 try:
                     intent, personal_search = self.llm.personal_query(question)
-                    if intent in {"fuel", "hotel", "daily", "approval"}:
+                    if intent in _TRAVEL_EVIDENCE and _TRAVEL_EVIDENCE[intent].search(_travel_spelling(expanded_question)):
                         personal = intent
                 except IncompleteCompletion:
                     raise
@@ -1147,6 +1147,40 @@ def _distance_rule_answer(question: str, passages, store, audiences, today):
         "from the permanent place of work, including transit time."
     )
     return sentence, [rule]
+
+
+# The personal-query classifier only chooses which travel lookup fits. The question's own words must name
+# that topic, so a model guess never sends a salary or loan question to a travel rate.
+_TRAVEL_EVIDENCE = {
+    "hotel": re.compile(r"\b(?:hotels?|lodging|accommodation|stay|overnight)\b", re.I),
+    "fuel": re.compile(r"\b(?:fuel|petrol|diesel|mileage|vehicle|car|km)\b", re.I),
+    "daily": re.compile(r"\b(?:allowances?|per diem|per day)\b", re.I),
+    "approval": re.compile(r"\b(?:approv\w*|authori[sz]\w*)\b.*\b(?:travel\w*|trip|tour)\b"
+                           r"|\b(?:travel\w*|trip|tour)\b.*\b(?:approv\w*|authori[sz]\w*)\b", re.I),
+}
+_TRAVEL_SPELLINGS = ("travel", "daily", "allowance", "hotel", "lodging", "accommodation", "mileage", "petrol",
+                     "diesel", "vehicle")
+
+
+def _travel_spelling(text: str) -> str:
+    """Correct a one-letter slip or swap in a travel word, as in "wat is my dailly alowance"."""
+    def fix(match: re.Match) -> str:
+        word = match.group(0).casefold()
+        if len(word) < 5 or word in _TRAVEL_SPELLINGS:
+            return match.group(0)
+        return next((target for target in _TRAVEL_SPELLINGS if _one_slip(word, target)), match.group(0))
+    return re.sub(r"[A-Za-z]+", fix, text)
+
+
+def _one_slip(word: str, target: str) -> bool:
+    if len(word) == len(target):
+        diff = [i for i, (a, b) in enumerate(zip(word, target)) if a != b]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1
+                                  and word[diff[0]] == target[diff[1]] and word[diff[1]] == target[diff[0]])
+    if abs(len(word) - len(target)) != 1:
+        return False
+    short, long = sorted((word, target), key=len)
+    return any(short == long[:i] + long[i + 1:] for i in range(len(long)))
 
 
 def _personal_travel_intent(question: str, fuel_question, requested_plan) -> str:

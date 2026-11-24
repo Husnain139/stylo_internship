@@ -17,6 +17,7 @@ from .access import (
     grade_band,
     allowed_audiences,
     asks_for_hidden,
+    has_medical_plan,
     visible_passage,
     names_other_grade,
     policy_row_roles,
@@ -428,6 +429,13 @@ class Pipeline:
                     and (not personal_medical or employee.designation in
                          (policy_row_roles(row.heading, row.body, row.title) or set()))
                 ]
+                if (personal_medical and not passages and not has_medical_plan(employee.designation)
+                        and any("medical" in policy.title.casefold() and shares_audience(policy.audience, audiences)
+                                for policy in self.store.list_policies())):
+                    state.update(outcome="dont_know", search="heading-lookup", answer=(
+                        "The medical policy's benefit schedule doesn't list a plan for the "
+                        f"{role_label(employee.designation)} designation. Ask HR which plan applies to you."))
+                    return self._finish(employee, question, state, started)
             elif approval_rows:
                 passages = list({row.id: row for row in approval_rows}.values())
             else:

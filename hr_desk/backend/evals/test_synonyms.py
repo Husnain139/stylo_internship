@@ -1,0 +1,49 @@
+"""Everyday words find the clause that uses the policy's own word: lawyer finds advocate, unpaid finds outstanding.
+
+The candidates are the real passages and vector scores the database returned for each question.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from datetime import date
+from pathlib import Path
+
+from app.aliases import expand_query
+from app.models import Passage
+from app.retrieve import search_passages, select_passages
+
+TODAY = date(2026, 11, 25)
+CANDIDATES = json.loads((Path(__file__).parent / "fixtures" / "synonym_candidates.json").read_text(encoding="utf-8"))
+LAWYER = "Can I bring a lawyer to my inquiry?"
+UNPAID = "Can I take a new PF loan while my old one is unpaid?"
+
+
+class _Store:
+    def __init__(self, question: str) -> None:
+        self._candidates = [
+            Passage(item["id"], item["id"].split(":")[0], "Policy", f"Policy, {item['heading']}", item["heading"],
+                    item["body"], "everyone", date(2026, 1, 1), None, vec_score=item["vec"],
+                    heading_path=item["path"], content_type=item["type"])
+            for item in CANDIDATES[question]
+        ]
+
+    def candidates(self, embedding, query, audiences, today, limit, **scope):
+        return [replace(p) for p in self._candidates]
+
+    def heading_hits(self, phrases, audiences, today, **scope):
+        return []
+
+
+def _selected_headings(question: str) -> list[str]:
+    passages = search_passages(_Store(question), [0.0], expand_query(question), {"everyone"}, TODAY)
+    return [p.heading for p in select_passages(passages)]
+
+
+def test_lawyer_finds_the_inquiry_clause_that_bars_an_advocate():
+    assert "6.6. Inquiry Process" in _selected_headings(LAWYER)
+
+
+def test_unpaid_loan_finds_the_clause_on_outstanding_loans():
+    assert "4. Eligibility Criteria:" in _selected_headings(UNPAID)

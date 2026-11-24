@@ -507,7 +507,12 @@ class Pipeline:
                 return self._finish(employee, question, state, started)
             everywhere = []
             if policy_ids is None and embedding is not None and employee.designation != "hr":
-                everywhere = [p for p in search_passages(self.store, embedding, search_text, set(AUDIENCES), today)
+                # Refuse on what the person asked. The model's search wording can name a policy they never did.
+                asked_text, asked_embedding = search_text, embedding
+                if personal_search:
+                    asked_text = expand_query(question)
+                    asked_embedding = self.embedder.embed([asked_text])[0]
+                everywhere = [p for p in search_passages(self.store, asked_embedding, asked_text, set(AUDIENCES), today)
                               if not contains_named_pay(f"{p.title}\n{p.body}")]
             # A weaker passage from an open policy does not answer what a closed policy covers.
             closed = everywhere[:1] if (everywhere and not shares_audience(everywhere[0].audience, audiences)

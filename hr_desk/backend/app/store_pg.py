@@ -314,7 +314,7 @@ class PostgresStore(PostgresOperations):
 
     def delete_session(self, token: str) -> None:
         with self._lock, self.conn.cursor() as cur, self.conn.transaction():
-            cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
+            cur.execute("DELETE FROM sessions WHERE token = %s", (digest(token),))
 
     def create_session(self, email: str) -> str:
         token = secrets.token_urlsafe(32)

@@ -448,7 +448,8 @@ class AnswerContractTests(unittest.TestCase):
 
     def test_closed_policy_match_is_refused_not_answered_from_an_open_one(self):
         pipeline = fixture_pipeline()
-        travel = "A travel request form must be submitted at least 7 days before the travel date."
+        travel = ("A dually signed travel request form must be submitted to Administration via HR "
+                  "at least 7 days before the travel date.")
         notes = "The request form must be submitted through ESS. Manual requests are not entertained."
         for id, title, audience, heading, body in (
             ("travel", "Travel Policy", "general_manager,hr", "3.2. Authorization of Travel", travel),

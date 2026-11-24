@@ -14,7 +14,7 @@ from .config import (
     RETRIEVE_TOP_K,
     RRF_K,
 )
-from .clauses import asked_clause, asked_page, contains_clause, heading_has_phrase, heading_phrases
+from .clauses import asked_clause, asked_page, contains_clause, heading_naming, heading_phrases
 from .models import Passage
 from .textutil import keyword_score, token_list, token_set
 
@@ -31,7 +31,7 @@ def _keep(passage: Passage) -> bool:
 
 
 _NEGATIVE = {"not", "no", "excluded", "cease", "without", "longer"}
-_GENERIC = {"short", "brief", "summary", "point", "points", "section", "clause", "heading", "explain", "describe"}
+_ANNEXURE = re.compile(r"(?i)\bannexure\s+([a-z])\b")
 
 
 def search_passages(
@@ -51,18 +51,23 @@ def search_passages(
                 seen.add(extra.id)
     if phrases and hasattr(store, "heading_hits"):
         for extra in store.heading_hits(phrases, audiences, today, **scope):
-            if extra.id not in seen:
+            # The heading lookup matches word pairs. Only a heading the question names joins the candidates.
+            if extra.id not in seen and _names_this(extra, query, page_number):
                 raw.append(extra)
                 seen.add(extra.id)
+    on_asked_page: list[str] = []
     if page_number and hasattr(store, "printed_page_hits"):
         for extra in store.printed_page_hits(page_number, audiences, today, **scope):
+            # A passage on the asked page is asked for, even when it was already a weak vector candidate.
+            on_asked_page.append(extra.id)
             if extra.id not in seen:
                 raw.append(extra)
                 seen.add(extra.id)
     words = token_set(query)
     negative = bool(words & _NEGATIVE)
     asks_for_form = bool(words & {"template", "form", "details"})
-    heading_order = [passage.id for passage in raw if _names_this(passage, phrases, page_number)]
+    heading_order = [passage.id for passage in raw if _names_this(passage, query, page_number)]
+    heading_order.extend(passage_id for passage_id in on_asked_page if passage_id not in heading_order)
     if number:
         heading_order.extend(
             passage.id for passage in raw
@@ -97,23 +102,15 @@ def search_passages(
         if passage.id in explicit or _keep(passage):
             kept.append(passage)
     kept.sort(key=lambda passage: passage.score, reverse=True)
-    def protected(passage: Passage) -> bool:
-        if number and contains_clause(f"{passage.heading}\n{passage.body}", number):
-            return True
-        return _names_this(passage, phrases, page_number)
-
-    if number or phrases or page_number:
-        named_passages = [passage for passage in kept if protected(passage)]
-        others = [passage for passage in kept if passage not in named_passages]
-        kept = named_passages + _prefer_distinctive(query, others)
-    else:
-        kept = _prefer_distinctive(query, kept)
-    kept.sort(key=lambda passage: passage.score, reverse=True)
-    named = [passage for passage in kept if _phrase_count(passage, phrases)]
+    # Only a heading named in full replaces the ranked list. Part of a title only lifts it in the fusion above.
+    naming = {passage.id: _naming(passage, query) for passage in kept}
+    named = [passage for passage in kept if naming[passage.id][0]]
     if named:
-        best = max(_phrase_count(passage, phrases) for passage in named)
-        named = [passage for passage in named if _phrase_count(passage, phrases) == best]
+        best = max(naming[passage.id] for passage in named)
+        named = [passage for passage in named if naming[passage.id] == best]
     on_page = [passage for passage in kept if _on_printed_page(passage, page_number, kept)]
+    # The printed "Page 5 of 10" footer finds the page. It has no policy text, so the page's sections answer.
+    on_page = [passage for passage in on_page if not _is_page_footer(passage)] or on_page
     if named or on_page:
         merged = []
         seen_ids = set()
@@ -126,24 +123,54 @@ def search_passages(
             top = max(passage.score for passage in merged)
             for passage in merged:
                 passage.score = top
-        return _with_distance_rule(store, query, merged[:16], audiences, today)
+        return _with_distance_rule(store, query, _with_referenced_table(store, merged[:16], audiences, today),
+                                   audiences, today)
     if kept and kept[0].content_type == "table" and hasattr(store, "heading_rows"):
-        rows = store.heading_rows(kept[0].policy_id, kept[0].heading, audiences, today)
+        top = kept[0]
+        # The sibling lookup stops at 16 rows, so the ranked rows of this table come first.
+        rows = [passage for passage in kept if (passage.policy_id, passage.heading) == (top.policy_id, top.heading)]
+        ranked = {passage.id for passage in rows}
+        rows += [row for row in store.heading_rows(top.policy_id, top.heading, audiences, today) if row.id not in ranked]
         if len(rows) > 1:
-            scores = {passage.id: passage.score for passage in kept}
-            rows.sort(key=lambda passage: scores.get(passage.id, 0.0), reverse=True)
-            for row in rows:
-                row.score = scores.get(row.id, 0.0)
+            for row in rows[len(ranked):]:
+                row.score = 0.0
             kept = rows
     if kept and kept[0].score < RERANK_FLOOR and not (named or on_page):
         return []
     limit = 16 if kept and kept[0].content_type == "table" and len(kept) > RETRIEVE_TOP_K else RETRIEVE_TOP_K
-    return _with_distance_rule(store, query, kept[:limit], audiences, today)
+    return _with_distance_rule(store, query, _with_referenced_table(store, kept[:limit], audiences, today),
+                               audiences, today)
+
+
+def _with_referenced_table(store, passages: list[Passage], audiences: set[str], today: date) -> list[Passage]:
+    """A section that leaves its figures to an annexure table, such as "limits defined in Annexure A" or
+    "the below Approval Authority Matrix", brings the rows of that table this role may see. A table that
+    already has a ranked row keeps only what the ranking chose."""
+    if not passages or passages[0].content_type != "section" or not hasattr(store, "heading_hits"):
+        return passages
+    top = passages[0]
+    body = top.body.casefold()
+    letters = {letter.casefold() for letter in _ANNEXURE.findall(top.body)}
+    ranked_tables = {(passage.policy_id, passage.heading) for passage in passages if passage.content_type == "table"}
+    rows = []
+    for row in store.heading_hits(["annexure"], audiences, today, policy_ids=[top.policy_id]):
+        label = _ANNEXURE.match(row.heading.strip())
+        if row.content_type != "table" or not label or (row.policy_id, row.heading) in ranked_tables:
+            continue
+        name = row.heading.strip()[label.end():].strip(" :-–").casefold()
+        if label.group(1).casefold() in letters or (len(name.split()) >= 2 and name in body):
+            rows.append(row)
+    if not rows:
+        return passages
+    attached = {row.id for row in rows}
+    for row in rows:
+        row.score = top.score
+    return [top, *rows, *(passage for passage in passages[1:] if passage.id not in attached)]
 
 
 def _rerank(passage: Passage, rrf: float) -> float:
-    """Order the fused candidates. A title-only passage loses to a real section."""
-    short = 0.04 if len(passage.body.encode("utf-8")) < 80 else 0.0
+    """Order the fused candidates. A title-only passage loses to a real section. A short table row is a whole fact."""
+    short = 0.04 if passage.content_type != "table" and len(passage.body.encode("utf-8")) < 80 else 0.0
     return rrf + 0.025 * passage.heading_kw + 0.01 * passage.body_kw - short
 
 
@@ -164,9 +191,8 @@ def _with_distance_rule(store, query: str, passages: list[Passage], audiences: s
     return passages
 
 
-def _phrase_count(passage: Passage, phrases: list[str]) -> int:
-    heading = f"{passage.heading}\n{passage.heading_path}"
-    return sum(1 for phrase in phrases if heading_has_phrase(heading, phrase))
+def _is_page_footer(passage: Passage) -> bool:
+    return bool(re.fullmatch(r"(?i)page\s+\d+\s+of\s+\d+", passage.heading.strip()))
 
 
 def _on_printed_page(passage: Passage, page_number: int, kept: list[Passage]) -> bool:
@@ -180,9 +206,12 @@ def _on_printed_page(passage: Passage, page_number: int, kept: list[Passage]) ->
     return (passage.policy_id, passage.page) in pages
 
 
-def _names_this(passage: Passage, phrases: list[str], page_number: int) -> bool:
-    heading = f"{passage.heading}\n{passage.heading_path}"
-    if any(heading_has_phrase(heading, phrase) for phrase in phrases):
+def _naming(passage: Passage, query: str) -> tuple[bool, int]:
+    return heading_naming(query, passage.heading, passage.heading_path, passage.title)
+
+
+def _names_this(passage: Passage, query: str, page_number: int) -> bool:
+    if _naming(passage, query)[1]:
         return True
     if page_number and passage.heading.lower().startswith(f"page {page_number} of"):
         return True
@@ -221,23 +250,6 @@ def _one_edit(left: str, right: str) -> bool:
         if left == right[:index] + right[index + 1 :]:
             return True
     return False
-
-
-def _prefer_distinctive(query: str, passages: list[Passage]) -> list[Passage]:
-    """Keep the passages that match the specific words, such as summary or retail."""
-    if len(passages) < 2:
-        return passages
-    distinctive = [token for token in set(token_list(query)) if len(token) >= 5 and token not in _GENERIC]
-
-    def hits(passage: Passage) -> int:
-        text = f"{passage.heading_path} {passage.heading} {passage.body}"
-        return sum(1 for token in distinctive if keyword_score(token, text) > 0)
-
-    best = max(hits(passage) for passage in passages)
-    if best <= 0:
-        return passages
-    narrowed = [passage for passage in passages if hits(passage) == best]
-    return narrowed or passages
 
 
 def select_passages(passages: list[Passage]) -> list[Passage]:

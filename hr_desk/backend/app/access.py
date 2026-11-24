@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-from .textutil import token_set
+from .textutil import matched_tokens, token_set
 
 ROLE_LABELS = {
     "intern": "Intern",
@@ -290,11 +290,9 @@ def asks_for_hidden(question: str, passages) -> bool:
     if not words:
         return False
     for passage in passages:
-        title = token_set(f"{getattr(passage, 'title', '')} {getattr(passage, 'heading', '')}")
-        if words & title:
+        if matched_tokens(words, f"{getattr(passage, 'title', '')} {getattr(passage, 'heading', '')}"):
             return True
-        body = token_set(getattr(passage, "body", ""))
-        if len(words & body) >= 2:
+        if len(matched_tokens(words, getattr(passage, "body", ""))) >= 2:
             return True
     return False
 

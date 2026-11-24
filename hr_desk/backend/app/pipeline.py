@@ -25,7 +25,7 @@ from .access import (
     role_label,
     shares_audience,
 )
-from .clauses import asked_clause, focus_clauses
+from .clauses import asked_clause, contains_clause, focus_clauses
 from .benefits import asks_for_benefit_overview, benefit_overview
 from .config import (
     EVIDENCE_MAX_BYTES,
@@ -102,6 +102,9 @@ _CLOSING_OFFER = re.compile(
     r"export|email|attach|upload|print|fill|open|write)\b|"
     r"(?:please )?let me know\b|would you like\b|next steps?\s*:)", re.I,
 )
+_POLICY_LIST = re.compile(r"\bpolicies\b", re.I)
+_POLICY_LIST_WORDS = {"all", "list", "show", "give", "available", "there", "see", "open", "access", "have",
+                      "which", "apply", "hr", "company", "every", "names"}
 _COMPARISON = re.compile(r"\b(?:compar\w*|versus|vs\.?|difference between|side.by.side)\b", re.I)
 _DA_CONDITION = re.compile(
     r"originating from the permanent place of work, applicable for journeys totaling "
@@ -220,12 +223,18 @@ class Pipeline:
                 r"\b(?:travel|hotel|accommodation|provident|salary)\b", question, re.I
             ))
             latest_answer = history[-1] if history and history[-1].get("role") == "assistant" else {}
-            if (not requested_plan and (reference is not None or medical_reference)
-                    and latest_answer.get("outcome") in {"refused", "clarification"}):
-                state.update(outcome="clarification", answer="Which policy or plan do you mean?",
-                             history_note="follow-up-after-unresolved-turn")
+            unresolved = latest_answer.get("outcome") in {"refused", "clarification"}
+            # "And the normal delivery for that plan?" after a refusal or a question back: the asker's own plan.
+            own_plan_follow_up = medical_reference and unresolved
+            if not requested_plan and reference is not None and not medical_reference and unresolved:
+                if latest_answer.get("outcome") == "refused":
+                    state.update(outcome="refused", answer=latest_answer.get("text") or REFUSAL, withheld=True,
+                                 history_note="repeat-boundary")
+                else:
+                    state.update(outcome="clarification", answer="Which policy or plan do you mean?",
+                                 history_note="follow-up-after-unresolved-turn")
                 return self._finish(employee, question, state, started)
-            if medical_reference:
+            if medical_reference and not own_plan_follow_up:
                 previous, labels = _policy_context(history)
                 if labels and all(_MEDICAL_SCHEDULE in label.casefold() for label in labels):
                     medical_follow_up = True
@@ -292,6 +301,13 @@ class Pipeline:
                              valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
                 return self._finish(employee, question, state, started)
 
+            catalog = _policy_catalog(question, self.store, employee.designation, today)
+            if catalog:
+                state.update(outcome="answered", search="done", history_note="policy-list",
+                             rewritten_question=question.strip(),
+                             answer="You can ask about these policies:\n" + "\n".join(f"- {title}" for title in catalog))
+                return self._finish(employee, question, state, started)
+
             form_link = self._travel_form_link(employee, question, today)
             if form_link:
                 outcome, answer, sources = form_link
@@ -314,10 +330,12 @@ class Pipeline:
                 personal = "fuel"
             elif re.fullmatch(r"TA[?.!]*", question.strip(), re.I):
                 personal = "approval"
-            personal_medical = bool(
+            personal_medical = own_plan_follow_up or bool(
                 not requested_plan and not reference and _PERSONAL.search(question)
                 and (medical_fields or re.search(r"\b(?:medical|health insurance|medical cover|hospitali[sz]ation|hospital|takaful|maternity|delivery)\b", question, re.I))
-                and not re.search(r"\b(?:claim|panel|form|submit|reimburse)\b", question, re.I)
+                # The plan schedule holds amounts. Claims, ages, dependents and leave are answered elsewhere.
+                and not re.search(r"\b(?:claim|panel|form|submit|reimburse|age|child(?:ren)?|dependents?|spouse"
+                                  r"|parents?|leave)\b", question, re.I)
             )
             personal_search = ""
             if (not personal and not personal_medical and not named and not reference and not requested_plan
@@ -353,12 +371,17 @@ class Pipeline:
                 state["answer"] = earlier
                 return self._finish(employee, question, state, started)
             policy_ids = None
+            search_text = ""
             approval_rows = []
             answer_question = expanded_question.strip()
             if named:
                 subject, policy_ids = named
                 subject = _SUMMARY_PREFIX.sub("", subject).strip() or subject
                 state.update(rewritten_question=subject, history_note="named-policy")
+                # "Who counts as a dependent" alone is too vague to embed. The title gives it the document's
+                # context; aliases of the title, such as hospitalization for medical insurance, would not.
+                title = next((p.title for p in self.store.list_policies() if p.id in policy_ids), "")
+                search_text = f"{expand_query(subject)} {title}".strip()
                 background = ""
             elif (requested_plan and not medical_follow_up) or personal_medical:
                 state.update(rewritten_question=question.strip(), history_note="explicit-medical-plan")
@@ -377,6 +400,9 @@ class Pipeline:
                 title = titles.pop()
                 policy_ids = [policy.id for policy in policies if policy.title == title]
                 state["rewritten_question"] = f"{reference or question.strip()} {title} {previous}".strip()
+                # The search is already limited to this document and the earlier question gives the context.
+                # Its title in the text would favour headings that repeat it, such as Corrective-Action.
+                search_text = expand_query(f"{reference or question.strip()} {previous}".strip())
                 state["history_note"] = "policy-follow-up"
                 background = previous
                 answer_question = f"{reference or question.strip()} under the {title}."
@@ -415,7 +441,6 @@ class Pipeline:
             chosen = []
             scope = {} if policy_ids is None else {"policy_ids": policy_ids}
             embedding = None
-            search_text = state["rewritten_question"]
             medical_lookup = bool(requested_plan or medical_follow_up or personal_medical)
             report_rows = self._report_rows(answer_question, employee.designation, audiences, today, scope)
             summary_fields_requested = _asks_summary_fields(answer_question)
@@ -444,7 +469,7 @@ class Pipeline:
             elif approval_rows:
                 passages = list({row.id: row for row in approval_rows}.values())
             else:
-                search_text = expand_query(state["rewritten_question"])
+                search_text = search_text or expand_query(state["rewritten_question"])
                 embedding = self.embedder.embed([search_text])[0]
                 passages = search_passages(self.store, embedding, search_text, audiences, today, **scope)
             passages = [p for p in passages if not contains_named_pay(f"{p.title}\n{p.body}")]
@@ -481,7 +506,17 @@ class Pipeline:
             if passages and not closed:
                 chosen = select_passages(passages)
                 probe = state["rewritten_question"] if policy_ids or personal_search or not topic_words(question) else question
-                matched = chosen if medical_lookup or report_rows else [p for p in chosen if asks_for_hidden(probe, [p])]
+                if state["history_note"] in {"model", "kept-question"} and not grade_band(question):
+                    # "And how many installments?" only names its subject through the rewrite.
+                    probe = state["rewritten_question"]
+                if named:
+                    # The named document is part of what the person asked, such as page 5 of the Travel Policy.
+                    probe = question
+                number = asked_clause(question)
+                matched = chosen if medical_lookup or report_rows else [
+                    p for p in chosen
+                    if asks_for_hidden(probe, [p]) or contains_clause(f"{p.heading}\n{p.body}", number)
+                ]
                 if not matched and not names_other_grade(employee.designation, question):
                     state["outcome"] = "dont_know"
                     state["answer"] = UNKNOWN
@@ -1563,6 +1598,19 @@ def _named_policy_scope(question: str, store) -> tuple[str, list[str]] | None:
         if subject and ids:
             return subject, ids
     return None
+
+
+def _policy_catalog(question: str, store, designation: str, today: date) -> list[str]:
+    """The titles this role can open, when the question asks for the policies themselves and nothing else."""
+    if not _POLICY_LIST.search(question) or not token_set(question) <= _POLICY_LIST_WORDS:
+        return []
+    audiences = set(allowed_audiences(designation))
+    return list(dict.fromkeys(
+        policy.title for policy in store.list_policies()
+        if shares_audience(policy.audience, audiences) and policy.effective_from <= today
+        and (policy.effective_to is None or policy.effective_to >= today)
+        and (policy.superseded_on is None or policy.superseded_on > today)
+    ))
 
 
 def _policy_context(history: list[dict]) -> tuple[str, list[str]]:

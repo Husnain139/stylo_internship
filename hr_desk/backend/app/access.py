@@ -284,32 +284,73 @@ def asks_for_hidden(question: str, passages) -> bool:
     return False
 
 
+# Grade names as the policy rows and annexures write them. Combined row labels
+# come first so "SM / AGM" reads as one row, not as two separate grades.
+_GRADE_NAMES = [
+    (r"se\s*(?:&|and)\s*below", _LOW_TRAVEL),
+    (r"sm\s*/\s*agm", _SM_AGM),
+    (r"am\s*(?:&|and)\s*m", {"assistant_manager", "manager"}),
+    (r"dgm\s+to\s+gm", {"deputy_general_manager", "general_manager"}),
+    (r"(?:coo\s*/\s*gc|gc\s*/\s*coo)", {"coo_business", "group_chief"}),
+    *sorted(
+        ((re.escape(label.casefold()), {role}) for role, label in ROLE_LABELS.items() if role not in {"employee", "hr"}),
+        key=lambda item: -len(item[0]),
+    ),
+    (r"salesmen", {"salesman"}),
+    (r"coo", {"coo_business"}),
+    *((name, {role}) for name, role in (
+        ("dgm", "deputy_general_manager"), ("agm", "assistant_general_manager"), ("gm", "general_manager"),
+        ("gc", "group_chief"), ("rsm", "regional_sales_manager"), ("asm", "area_sales_manager"),
+    )),
+]
+# Two-letter grades that are also ordinary words ("I am") count only in capitals.
+_CAPITAL_GRADES = [("AM", {"assistant_manager"}), ("SM", {"senior_manager"}), ("SE", {"senior_executive"})]
+_PLURAL = r"(?:s|es)?(?:'s|’s|'|’)?(?!\w)"
+
+
+def named_grades(question: str) -> set[str]:
+    """Designations a question names, read longest name first."""
+    text = question or ""
+    found: set[str] = set()
+    for names, flags in ((_GRADE_NAMES, re.I), (_CAPITAL_GRADES, 0)):
+        for name, roles in names:
+            pattern = re.compile(rf"\b{name}{_PLURAL}", flags)
+            if pattern.search(text):
+                found |= roles
+                text = pattern.sub(" ", text)
+    return found
+
+
 def names_other_grade(designation: str, question: str) -> bool:
-    """The question names a grade row this role does not see."""
-    if designation not in {"employee", "manager"}:
+    """The question names a grade, and the asker is not in it."""
+    if designation == "hr":
         return False
+    named = named_grades(question)
+    if named:
+        return designation not in named
     band = grade_band(question)
-    return bool(band and band != "all" and band != designation)
+    return designation in {"employee", "manager", "intern", "trainee"} and band not in {None, "all", designation}
 
 
 def role_reason(designation: str, passages) -> str:
     """Why this role stops here. The hidden text itself stays out of the answer."""
-    titles: list[str] = []
+    titles: dict[str, bool] = {}
+    allowed = set(allowed_audiences(designation))
     for passage in passages:
         title = getattr(passage, "title", "") or ""
         if title and title not in titles:
-            titles.append(title)
+            titles[title] = not shares_audience(getattr(passage, "audience", "everyone"), allowed)
     if not titles:
         return "I can't share that. It sits outside your role."
     reasons = []
-    for title in titles:
-        reason = _boundary(designation, title)
+    for title, closed in titles.items():
+        reason = _boundary(designation, title, closed)
         if reason not in reasons:
             reasons.append(reason)
     return " ".join(reasons)
 
 
-def _boundary(designation: str, title: str) -> str:
+def _boundary(designation: str, title: str, closed: bool = False) -> str:
     folded = title.lower()
     if designation == "intern" and "travel" in folded:
         return (
@@ -333,6 +374,8 @@ def _boundary(designation: str, title: str) -> str:
         )
     if designation == "intern":
         return "I can't share that. An internship doesn't include this policy."
+    if closed:
+        return f"I can't share the {title}. It doesn't cover your role. Ask HR if you need help."
     return "I can't share that. It is written for a different grade, and your role doesn't include that grade."
 
 

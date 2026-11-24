@@ -5,11 +5,12 @@ from __future__ import annotations
 import re
 from datetime import date
 
-from .access import allowed_audiences, can_see_passage, role_label, shares_audience, visible_passage
+from .access import (allowed_audiences, can_see_passage, policy_row_roles, role_label, shares_audience,
+                     visible_passage)
 from .guardrails import contains_named_pay
 from .models import Employee, Passage
 from .sanitize import exposes_prompt
-from .textutil import token_set
+from .textutil import matched_tokens, token_set
 
 _OVERVIEW = re.compile(
     r"\b(?:facilit(?:y|ies)|benefits?|perks?|entitlements?|allowances?)\b", re.I
@@ -27,6 +28,12 @@ _BENEFIT_TITLE = re.compile(
     r"provident|loan|pension|retirement|advance salary|scholarship)\b", re.I
 )
 _HEADINGS = ["eligibility", "scope", "applicability", "coverage", "purpose", "benefits"]
+# "medical policy" or "tell me about health" names only the topic, so it asks what the policy gives this role.
+_MEDICAL_TOPIC = "medical health insurance takaful"
+_TOPIC_FILLER = "policy policies tell about explain info information details overview show give my our plan cover coverage"
+_MEDICAL_SCHEDULE = "medical benefit schedule"
+_MEDICAL_CLAIMS = ["claims in case of panel", "claim in case of non-panel hospital"]  # The printed heading reads "Panel Hospital1".
+_FIELD = re.compile(r"(?:^|\.\s+)([A-Z][^:.]{1,70}):\s*([^.]+)")
 _TRAVEL_HEADINGS = ["eligibility", "accommodation", "daily allowance", "fuel entitlement list",
                     "travel expense form", "mode of travel"]
 
@@ -109,3 +116,75 @@ def _summary(title: str, evidence: list[Passage]) -> str:
             f"Salary advance: available to eligible Head Office (RSC) employees.{dates}"
         )
     return f"{title}: a policy is available, but I can't confirm your eligibility from your designation alone."
+
+
+def asks_for_medical_overview(question: str) -> bool:
+    words = token_set(question)
+    vocabulary = f"{_MEDICAL_TOPIC} {_TOPIC_FILLER}"
+    leftover = words - matched_tokens(words, vocabulary)
+    return (bool(words) and bool(matched_tokens(words, _MEDICAL_TOPIC))
+            and all(_one_swap(word, vocabulary.split()) for word in leftover))
+
+
+def _one_swap(word: str, vocabulary: list[str]) -> bool:
+    """"ploicy" is "policy" with two neighbouring letters swapped."""
+    return any(len(word) == len(known) and any(
+        word[:i] + word[i + 1] + word[i] + word[i + 2:] == known for i in range(len(word) - 1)
+    ) for known in vocabulary)
+
+
+def medical_overview(store, employee: Employee, today: date) -> tuple[str, list[Passage]] | None:
+    """Who is covered, the asker's own plan row, and how to claim. None when the role can't open the policy."""
+    role = employee.designation
+    audiences = set(allowed_audiences(role))
+    policy = next((p for p in store.list_policies()
+                   if "medical" in p.title.casefold() and shares_audience(p.audience, audiences)), None)
+    if policy is None:
+        return None
+
+    def hits(headings: list[str], kind: str) -> list[Passage]:
+        return [p for p in store.heading_hits(headings, audiences, today, policy_ids=[policy.id])
+                if p.content_type == kind and shares_audience(p.audience, audiences) and visible_passage(role, p)
+                and not contains_named_pay(f"{p.title}\n{p.body}") and not exposes_prompt(p.body)]
+
+    eligibility = hits(["eligibility"], "section")
+    rows = sorted((p for p in hits([_MEDICAL_SCHEDULE], "table")
+                   if role == "hr" or role in (policy_row_roles(p.heading, p.body, p.title) or set())),
+                  key=lambda p: _plan_line(p))
+    claims = {heading: [p for p in hits([heading], "section") if p.heading.casefold().find(heading) >= 0]
+              for heading in _MEDICAL_CLAIMS}
+    lines = []
+    if eligibility:
+        lines.append(f"Who is covered: {_clauses(eligibility[0].body, 2)}")
+    if rows:
+        lines.extend(_plan_line(row) for row in rows)
+    else:
+        lines.append(f"Your plan: the benefit schedule doesn't list a plan for the {role_label(role)} designation. "
+                     "Ask HR which plan applies to you.")
+    for heading, where in zip(_MEDICAL_CLAIMS, ("a panel hospital", "a non-panel hospital")):
+        if claims[heading]:
+            lines.append(f"Claims at {where}: {_clauses(_earliest(claims[heading]).body, 1)}")
+    answer = (f"{policy.title}, for your designation ({role_label(role)}):\n\n"
+              + "\n".join(f"- {line}" for line in lines)
+              + "\n\nAsk about any part, such as maternity, exclusions, or a non-panel claim, for the details.")
+    return answer, [*eligibility, *rows, *(p for found in claims.values() for p in found)]
+
+
+def _plan_line(row: Passage) -> str:
+    fields = [(label.strip(), value.strip()) for label, value in _FIELD.findall(row.body)]
+    plan = next((value for label, value in fields if label.casefold() == "plan"), "Your plan")
+    figures = "; ".join(f"{label} {value}" for label, value in fields if label.casefold() not in {"plan", "grades"})
+    return f"{plan}: {figures}." if figures else f"{plan}."
+
+
+def _clauses(text: str, count: int) -> str:
+    """The first numbered clauses, such as 2.1 and 2.2, without their numbers. Word bullet glyphs become separators."""
+    flat = re.sub(r"\s*;\s*", "; ", re.sub(r"\s+", " ", text.replace("", ";"))).strip()
+    parts = [part for part in re.split(r"\s*\b\d+(?:\.\d+)+\.\s+", flat) if part.strip(" ;")]
+    kept = [re.sub(r":\s*;\s*", ": ", part).strip(" ;").rstrip(".") for part in parts[:count]]
+    return ". ".join(kept) + "."
+
+
+def _earliest(passages: list[Passage]) -> Passage:
+    """A section split across chunks starts in the chunk holding its first clause."""
+    return min(passages, key=lambda p: [int(n) for n in re.findall(r"\d+", (re.search(r"\d+(?:\.\d+)+", p.body) or [""])[0])])

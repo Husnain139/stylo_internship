@@ -27,7 +27,7 @@ from .access import (
     shares_audience,
 )
 from .clauses import asked_clause, contains_clause, focus_clauses
-from .benefits import asks_for_benefit_overview, benefit_overview
+from .benefits import asks_for_benefit_overview, asks_for_medical_overview, benefit_overview, medical_overview
 from .config import (
     EVIDENCE_MAX_BYTES,
     MAX_PASSAGES,
@@ -301,6 +301,16 @@ class Pipeline:
                 answer, sources = benefit_overview(self.store, employee, today)
                 state.update(outcome="answered" if sources else "dont_know", answer=answer, search="done",
                              history_note="benefit-overview", rewritten_question=question.strip(),
+                             sections=list(dict.fromkeys(p.section_label for p in sources)),
+                             citations=[_citation(p) for p in sources],
+                             valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
+                return self._finish(employee, question, state, started)
+
+            overview = medical_overview(self.store, employee, today) if asks_for_medical_overview(question) else None
+            if overview:
+                answer, sources = overview
+                state.update(outcome="answered", answer=answer, search="heading-lookup",
+                             history_note="medical-overview", rewritten_question=question.strip(),
                              sections=list(dict.fromkeys(p.section_label for p in sources)),
                              citations=[_citation(p) for p in sources],
                              valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))

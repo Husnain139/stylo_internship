@@ -10,7 +10,9 @@
         {"phrase": "health insurance", "source": "judgment"},
         {"phrase": "medical cover", "source": "judgment"},
         {"phrase": "hospitalization", "source": "judgment; medical headings use hospitalization and in-patient"},
-        {"phrase": "takaful", "source": "source filename: Medical Takaful Policy 051124.pdf"}
+        {"phrase": "takaful", "source": "source filename: Medical Takaful Policy 051124.pdf"},
+        {"phrase": "medical", "source": "user request: \"medical\" alone means the Medical Insurance Policy"},
+        {"phrase": "health", "source": "user request: \"health policy\" means the Medical Insurance Policy"}
       ]
     },
     {

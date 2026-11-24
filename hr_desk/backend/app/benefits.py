@@ -9,17 +9,19 @@ from .access import allowed_audiences, can_see_passage, role_label, shares_audie
 from .guardrails import contains_named_pay
 from .models import Employee, Passage
 from .sanitize import exposes_prompt
+from .textutil import token_set
 
 _OVERVIEW = re.compile(
     r"\b(?:facilit(?:y|ies)|benefits?|perks?|entitlements?|allowances?)\b", re.I
 )
 _BROAD = re.compile(r"\b(?:all|every|list|overview|what|which|available|eligible|qualify|avail)\b", re.I)
 _SELF = re.compile(r"\b(?:my|i|for me|for myself)\b", re.I)
-_NARROW = re.compile(
-    r"\b(?:maternity|medical|insurance|takaful|health|travel|hotel|fuel|lodging|transport|mileage|per diem|tour|"
-    r"provident|loan|advance salary|leave|retirement|overtime|plan\s+[a-e]|annexure|section|clause|except|exclude\w*)\b",
-    re.I,
-)
+# Any other word names the benefit ("daily allowance", "hospitalization benefit"), so it is not an overview.
+_OVERVIEW_WORDS = {
+    "facility", "facilities", "benefit", "benefits", "perk", "perks", "entitlement", "entitlements",
+    "allowance", "allowances", "all", "every", "list", "overview", "which", "available", "eligible",
+    "qualify", "avail", "entitled", "am", "have", "any", "there", "myself",
+}
 _BENEFIT_TITLE = re.compile(
     r"\b(?:benefits?|facilities|allowances?|entitlements?|insurance|takaful|leave|reimbursement|"
     r"provident|loan|pension|retirement|advance salary|scholarship)\b", re.I
@@ -31,7 +33,7 @@ _TRAVEL_HEADINGS = ["eligibility", "accommodation", "daily allowance", "fuel ent
 
 def asks_for_benefit_overview(question: str) -> bool:
     return bool(_OVERVIEW.search(question) and _BROAD.search(question)
-                and _SELF.search(question) and not _NARROW.search(question))
+                and _SELF.search(question) and token_set(question) <= _OVERVIEW_WORDS)
 
 
 def benefit_overview(store, employee: Employee, today: date) -> tuple[str, list[Passage]]:

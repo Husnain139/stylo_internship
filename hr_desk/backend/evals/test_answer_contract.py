@@ -115,7 +115,7 @@ class AnswerContractTests(unittest.TestCase):
         self.assertEqual(sanitize(CANARY, []), REFUSAL)
         self.assertEqual(sanitize("I couldn’t find this in the policies I can open.", []), UNKNOWN)
         self.assertEqual(sanitize("I can't answer that", []), REFUSAL)
-        self.assertEqual(sanitize("The passages you provided say to confirm the rate.", []), REFUSAL)
+        self.assertEqual(sanitize("The passages you provided say to ask HR first.", []), "The policy says to ask HR first.")
         self.assertFalse(_visible(GM.designation, passage("private", "Employee name: Sample Name; Salary: 123")))
         self.assertTrue(_visible(GM.designation, passage("public", "The policy defines salary bands.")))
         result = Pipeline(MemoryStore(), None, None).ask(GM, "what was my last question?",
@@ -152,8 +152,7 @@ class AnswerContractTests(unittest.TestCase):
         self.assertNotEqual(result.answer, REFUSAL)
 
     def test_deterministic_output_guard_checks_before_cleaning(self):
-        for text in ("The excerpt says yes.", "Check C:\\HR\\rates.pdf.",
-                     "The supplied policy says yes.", "See /srv/hr/policy.docx.", "Use what you provided."):
+        for text in ("Check C:\\HR\\rates.pdf.", "See /srv/hr/policy.docx.", f"The marker is {CANARY}."):
             with self.subTest(text=text):
                 pipeline = fixture_pipeline()
                 pipeline._personal_travel = Mock(return_value=("answered", text, []))
@@ -162,12 +161,15 @@ class AnswerContractTests(unittest.TestCase):
                 self.assertEqual(result.answer, REFUSAL)
                 self.assertIn(result.trace_id, "\n".join(log.output))
                 self.assertNotIn(text, "\n".join(log.output))
+        pipeline = fixture_pipeline()
+        pipeline._personal_travel = Mock(return_value=("answered", "The excerpt says yes.", []))
+        self.assertIn("The policy says yes.", pipeline.ask(GM, "DA for me").answer)
 
     def test_final_guard_checks_saved_answers(self):
         pipeline = fixture_pipeline()
         source = passage("rate", "Grade: GM. Daily Allowance: 1,800", "table")
         pipeline.store.cache_lookup = Mock(return_value={
-            "answer": "The excerpt says yes.",
+            "answer": "See /srv/hr/policy.docx.",
             "outcome": "answered",
             "citations": [{"passage_id": source.id, "label": source.section_label, "text": source.body}],
         })

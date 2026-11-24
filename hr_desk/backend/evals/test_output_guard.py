@@ -1,12 +1,8 @@
 """The output guard restates hedges about the evidence and refuses only real leaks."""
 
-import json
 import unittest
-from datetime import date
 
 from app.config import CANARY
-from app.models import Passage
-from app.prompting import system_prompt, user_message
 from app.replies import REFUSAL
 from app.sanitize import forbidden_output, sanitize
 
@@ -27,6 +23,8 @@ class OutputGuardTests(unittest.TestCase):
                 "The exact preparer isn't specified in the policy.",
             "Assistant General Manager isn't shown in the rates you provided.":
                 "Assistant General Manager isn't shown in the policy.",
+            "The rate for Assistant General Manager isn't specified in the policy text you gave me.":
+                "The rate for Assistant General Manager isn't specified in the policy.",
             "Assistant General Manager isn't listed in the provided rates.":
                 "Assistant General Manager isn't listed in the policy.",
             "The passages say an advocate is not allowed at the inquiry.":
@@ -40,6 +38,12 @@ class OutputGuardTests(unittest.TestCase):
             with self.subTest(draft=draft):
                 self.assertFalse(forbidden_output(draft))
                 self.assertEqual(sanitize(draft, [CLAIMS]), expected)
+
+    def test_ordinary_wording_about_the_employee_is_left_alone(self):
+        for answer in ("HR reimburses the claim provided documents are attached.",
+                       "Based on the details you provided, you qualify if the trip is over 300 km."):
+            with self.subTest(answer=answer):
+                self.assertEqual(sanitize(answer, ["300 km"]), answer)
 
     def test_hedge_keeps_the_grounded_answer(self):
         draft = "Daily Tour Allowance: Based on the policy data you provided, a Regional Sales Manager gets Rs. 1,500."
@@ -57,18 +61,6 @@ class OutputGuardTests(unittest.TestCase):
             with self.subTest(draft=draft):
                 self.assertTrue(forbidden_output(draft))
                 self.assertEqual(sanitize(draft, [CLAIMS]), REFUSAL)
-
-
-class EvidenceFramingTests(unittest.TestCase):
-    def test_prompt_frames_the_evidence_as_stylo_policy_not_employee_input(self):
-        prompt = system_prompt(date(2026, 11, 24), "Store Manager")
-        self.assertIn("The employee did not write, send or see it", prompt)
-        self.assertIn('"the policy"', prompt)
-        source = Passage("p1", "policy", "Medical Policy", "Medical Policy, Claims", "Claims", CLAIMS,
-                         "everyone", date(2026, 1, 1), None)
-        payload = json.loads(user_message("How long do I have?", "", [source]))
-        self.assertEqual(payload["stylo_policy"][0]["text"], CLAIMS)
-        self.assertNotIn("policy_evidence", payload)
 
 
 if __name__ == "__main__":

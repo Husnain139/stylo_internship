@@ -20,10 +20,26 @@ _ECHO = re.compile(
     r"^(source\b|effective\b|source line\b|if you want\b|if the passage\b|next,\s|we would add\b)",
     re.I,
 )
+_DETERMINER = r"(?:the|this|that|these|those|your)\s+"
+_DET = rf"(?:{_DETERMINER})?"
+_SUPPLIED = r"(?:provided|supplied|shared)"
+_YOU_GAVE = rf"you(?:'ve|\s+have)?\s+(?:{_SUPPLIED}|given|gave|sent)(?:\s+(?:me|us))?"
+_EVIDENCE_NOUN = (r"policy\s+(?:text|data|excerpts?|evidence|passages?|information|details|documents?|sections?)"
+                  r"|polic(?:y|ies)|text|excerpts?|passages?|rates")
+_EVIDENCE_REFERENCE = re.compile(
+    rf"\b(?:{_DET}(?:{_EVIDENCE_NOUN})\s+(?:that\s+)?{_YOU_GAVE}"
+    rf"|{_DETERMINER}{_SUPPLIED}\s+(?:{_EVIDENCE_NOUN})"
+    rf"|{_DET}(?:policy\s+(?:text|data|excerpts?|evidence|passages?)|excerpts?|passages?)\s+{_SUPPLIED}"
+    rf"|what\s+{_YOU_GAVE}"
+    rf"|{_DET}(?:policy\s+)?(?:excerpts?|passages?)|{_DET}policy\s+evidence|your\s+policy\s+(?:text|data))\b"
+    r"(?P<verb>\s+(?:say|state|show|mention|specify|list|include|cover|contain|do|don't|are|aren't|have)\b)?",
+    re.I,
+)
+_SINGULAR_VERB = {"say": "says", "state": "states", "show": "shows", "mention": "mentions", "specify": "specifies",
+                  "list": "lists", "include": "includes", "cover": "covers", "contain": "contains", "do": "does",
+                  "don't": "doesn't", "are": "is", "aren't": "isn't", "have": "has"}
 _INTERNAL_WORDING = re.compile(
-    r"\b(?:your excerpt|the (?:passages?|excerpt|supplied policy)|what you provided|"
-    r"(?:provided|supplied) (?:excerpt|passages?|policy text)|(?:policy text|excerpt|passages?) (?:provided|supplied)|"
-    r"(?:provide|confirm|share)(?:\s+or\s+(?:confirm|share))?\s+(?:the\s+)?(?:policy text|rates?|amounts?)|"
+    r"\b(?:(?:provide|confirm|share)(?:\s+or\s+(?:confirm|share))?\s+(?:the\s+)?(?:policy text|rates?|amounts?)|"
     r"system prompt|verified employee designation)\b", re.I,
 )
 _FILE_PATH = re.compile(
@@ -58,15 +74,26 @@ _ANNEXURE_LABEL = re.compile(r"\bannexures?\s+[a-z0-9]+\b", re.I)
 _ANNEXURE_WORD = re.compile(r"\bannexures?\b", re.I)
 
 
+def _as_the_policy(match: re.Match[str]) -> str:
+    verb = (match.group("verb") or "").strip()
+    reference = match.group(0)[: len(match.group(0)) - len(match.group("verb") or "")]
+    phrase = "The policy" if reference[0].isupper() else "the policy"
+    if re.search(r"(?:excerpts|passages|rates|documents|details|sections|policies|these|those)\b", reference, re.I):
+        verb = _SINGULAR_VERB.get(verb.casefold(), verb)
+    return f"{phrase} {verb}".rstrip()
+
+
 def soften_labels(text: str) -> str:
-    """Drop an annexure label and keep the sentence. The canary and other bans stay."""
+    """Drop an annexure label and keep the sentence, and call the evidence "the policy".
+
+    The canary and other bans stay."""
     cleaned = _ANNEXURE_WORD.sub("", _ANNEXURE_LABEL.sub("", text or ""))
+    cleaned = _EVIDENCE_REFERENCE.sub(_as_the_policy, cleaned)
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
 
 def forbidden_output(text: str) -> bool:
-    return (exposes_prompt(text) or bool(_INTERNAL_WORDING.search(text))
-            or bool(_FILE_PATH.search(_URL.sub("", text))))
+    return exposes_prompt(text) or bool(_FILE_PATH.search(_URL.sub("", text)))
 
 
 def fixed_reply(answer: str) -> str:

@@ -49,3 +49,15 @@ def test_lawyer_finds_the_inquiry_clause_that_bars_an_advocate():
 
 def test_unpaid_loan_finds_the_clause_on_outstanding_loans():
     assert "4. Eligibility Criteria:" in _selected_headings(UNPAID)
+
+
+def test_a_tie_on_meaning_does_not_let_an_unrelated_passage_past_the_word_filter():
+    # "What are the official office timings?" Nothing answers it. The nearest passage only shares "office"
+    # and leads the next one by 0.001, so it is no closer in meaning than the rest.
+    near = [("pf:12", "12. Effective Date:", "This policy shall be effective immediately and applies to all permanent Head Office (RSC) employees of the company.", 0.340),
+            ("coc:3", "Guidelines for All Employees", "All employees are expected to follow these guidelines at all times while at work and when representing the brand.", 0.339)]
+    store = _Store(LAWYER)
+    store._candidates = [Passage(pid, pid.split(":")[0], "Policy", f"Policy, {heading}", heading, body, "everyone",
+                                 date(2026, 1, 1), None, vec_score=vec, heading_path=heading)
+                         for pid, heading, body, vec in near]
+    assert search_passages(store, [0.0], "What are the official office timings?", {"everyone"}, TODAY) == []

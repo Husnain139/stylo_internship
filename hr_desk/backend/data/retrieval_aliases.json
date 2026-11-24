@@ -88,6 +88,15 @@
         {"phrase": "provident fund", "source": "indexed title: Provident Fund Loan Policy"},
         {"phrase": "pf", "source": "judgment"}
       ]
+    },
+    {
+      "id": "outstanding",
+      "match": "outstanding pf loan",
+      "means": "outstanding",
+      "aliases": [
+        {"phrase": "outstanding", "source": "Provident Fund Loan Policy 4.3: any outstanding PF Loan must be fully settled"},
+        {"phrase": "unpaid", "source": "judgment; everyday word for an outstanding loan"}
+      ]
     }
   ]
 }

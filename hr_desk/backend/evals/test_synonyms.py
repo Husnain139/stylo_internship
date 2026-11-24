@@ -1,5 +1,7 @@
-"""Everyday words find the clause that uses the policy's own word: lawyer finds advocate, unpaid finds outstanding.
+"""Everyday words reach the clause written in the policy's own words.
 
+"lawyer" never appears in the clause that bars an advocate, so the closest meaning must survive the word filter.
+"unpaid" ties several loan sections on meaning, so the alias to "outstanding" picks the clause that settles it.
 The candidates are the real passages and vector scores the database returned for each question.
 """
 

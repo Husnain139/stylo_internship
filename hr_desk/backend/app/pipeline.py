@@ -75,6 +75,12 @@ _PERSONAL = re.compile(r"\b(?:my|for me|for myself|am i|do i|can i|should i|as a
 _VEHICLE_CC = re.compile(r"\b(\d{2,4})\s*cc\b", re.I)
 _FUEL_SCHEDULE = "fuel entitlement list"
 _TRAVEL_APPROVAL = "authorization of travel"
+_ENTITLEMENT = re.compile(
+    r"\b(?:fuel|mileage|petrol|entitle\w*|allowances?|benefits?|coverage|cover(?:ed)?|plans?|reimburse\w*|"
+    r"hotels?|stay|accommodation|lodging|DA|TA|tour|delivery|maternity|hospitali[sz]ation|room|limits?|rates?|"
+    r"eligib\w*|air|flights?|vehicle)\b",
+    re.I,
+)
 _TRAVEL_DEADLINE = re.compile(r"\b(?:when|how (?:early|far in advance)|deadline)\b.*\btravel request form\b", re.I)
 _HOTEL_SCHEDULE = "annexure c"
 _RULE_REQUEST = re.compile(r"\b(?:policy|rules?)\b|\bhow\b[^?.!]{0,55}\b(?:work|works|apply|applies)\b", re.I)
@@ -192,8 +198,7 @@ class Pipeline:
             if requested_plan:
                 requested_roles = policy_row_roles("Medical Benefit Schedule", requested_plan[0])
             if (requested_roles and employee.designation not in requested_roles | {"hr"}
-                    or (grade_question and not requested_roles and employee.designation in {"employee", "intern", "trainee"}
-                        and employee.designation != grade)):
+                    or (_ENTITLEMENT.search(question) and names_other_grade(employee.designation, question))):
                 state["outcome"] = "refused"
                 state["answer"] = "I can't share an entitlement for a different grade. Ask HR if you need help."
                 state["withheld"] = True
@@ -466,7 +471,14 @@ class Pipeline:
                              evidence_ids=[p.id for p in sources], sections=[p.section_label for p in sources],
                              citations=[_citation(p) for p in sources])
                 return self._finish(employee, question, state, started)
-            if passages:
+            everywhere = []
+            if policy_ids is None and embedding is not None and employee.designation != "hr":
+                everywhere = [p for p in search_passages(self.store, embedding, search_text, set(AUDIENCES), today)
+                              if not contains_named_pay(f"{p.title}\n{p.body}")]
+            # A weaker passage from an open policy does not answer what a closed policy covers.
+            closed = everywhere[:1] if (everywhere and not shares_audience(everywhere[0].audience, audiences)
+                                        and asks_for_hidden(question, everywhere[:1])) else []
+            if passages and not closed:
                 chosen = select_passages(passages)
                 probe = state["rewritten_question"] if policy_ids or personal_search or not topic_words(question) else question
                 matched = chosen if medical_lookup or report_rows else [p for p in chosen if asks_for_hidden(probe, [p])]
@@ -615,16 +627,9 @@ class Pipeline:
                         state["outcome"] = "answered"
                         state["answer"] = answer
                         state["citations"] = [_citation(passage, employee.designation == "hr") for passage in chosen]
-            elif policy_ids is None and embedding is not None:
-                everywhere = search_passages(
-                    self.store,
-                    embedding,
-                    search_text,
-                    set(AUDIENCES),
-                    today,
-                )
-                hidden = [p for p in everywhere if not contains_named_pay(f"{p.title}\n{p.body}")
-                          and (not shares_audience(p.audience, audiences) or not _visible(employee.designation, p))]
+            elif everywhere:
+                hidden = closed or [p for p in everywhere if not shares_audience(p.audience, audiences)
+                                    or not _visible(employee.designation, p)]
                 if hidden and asks_for_hidden(question, hidden):
                     state["withheld"] = True
                     state["outcome"] = "refused"

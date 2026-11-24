@@ -19,6 +19,7 @@ from .access import (
     asks_for_hidden,
     has_medical_plan,
     visible_passage,
+    named_grades,
     names_other_grade,
     policy_row_roles,
     role_reason,
@@ -200,8 +201,12 @@ class Pipeline:
             medical_fields = _medical_fields(question)
             if requested_plan:
                 requested_roles = policy_row_roles("Medical Benefit Schedule", requested_plan[0])
+            # "And for a General Manager?" carries its entitlement topic in the question before it.
+            asked_before = next((turn.get("text") or "" for turn in reversed(history or [])
+                                 if turn.get("role") == "user"), "")
+            entitlement_topic = _ENTITLEMENT.search(question) or _ENTITLEMENT.search(asked_before)
             if (requested_roles and employee.designation not in requested_roles | {"hr"}
-                    or (_ENTITLEMENT.search(question) and names_other_grade(employee.designation, question))):
+                    or (entitlement_topic and names_other_grade(employee.designation, question))):
                 state["outcome"] = "refused"
                 state["answer"] = "I can't share an entitlement for a different grade. Ask HR if you need help."
                 state["withheld"] = True
@@ -482,9 +487,13 @@ class Pipeline:
                     and requested_roles <= roles
                 ]
             elif grade_question and employee.designation in {"employee", "hr"}:
+                # A named grade picks its own row. Bands put "Senior Manager" with "AM & M", not "AGM & SM".
+                named = named_grades(question)
                 matching_rows = [
-                    passage for passage in passages
-                    if passage.content_type == "table" and grade_band(f"{passage.heading} {passage.body}") == grade
+                    passage for passage in passages if passage.content_type == "table" and (
+                        bool(named & (policy_row_roles(passage.heading, passage.body, passage.title) or set()))
+                        if named else grade_band(f"{passage.heading} {passage.body}") == grade
+                    )
                 ]
                 if matching_rows:
                     passages = matching_rows

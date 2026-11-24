@@ -14,6 +14,13 @@ from .config import SESSION_HOURS, CACHE_MAX_ROWS, CACHE_TTL_MINUTES
 from .operations import PostgresOperations, SCHEMA as OPERATIONS_SCHEMA, complete_policy_job, digest
 from .models import ChunkDraft, Employee, Passage, PolicyDraft, TraceRecord
 
+_REFERENCE_SOURCES = (
+    "Travel Policy - Stylo May-2025.pdf",
+    "Medical Takaful Policy 051124.pdf",
+    "Provident Fund Loan Policy – Head Office.docx",
+    "User Guidelines - Advance Salary (HO - RSC).docx",
+)
+
 _SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -192,14 +199,23 @@ class PostgresStore(PostgresOperations):
                 cur.execute("UPDATE policy_chunks SET audience = 'employee,manager,hr,executive' WHERE policy_id = ANY(%s)",
                             (changed_ids,))
                 cur.execute("DELETE FROM answer_cache")
-            # Expand the original library's default audiences, but leave HR's custom audiences intact.
-            cur.execute("""SELECT id, title FROM policies
-                           WHERE source_name IN ('Travel Policy - Stylo May-2025.pdf', 'Medical Takaful Policy 051124.pdf')
-                             AND audience = 'employee,manager,hr,executive' AND previous_id IS NULL""")
-            for policy_id, title in cur.fetchall():
+            # Keep the original library on the audiences its policy text names. An audience
+            # HR chose is in the audit log, and that choice stays.
+            cur.execute("""SELECT p.id, p.title, p.audience FROM policies p
+                           WHERE p.source_name = ANY(%s) AND p.previous_id IS NULL
+                             AND NOT EXISTS (SELECT 1 FROM admin_actions a
+                                             WHERE a.action = 'changed policy access'
+                                               AND left(a.detail, length(p.title) + 1) = p.title || ':')""",
+                        (list(_REFERENCE_SOURCES),))
+            converged = False
+            for policy_id, title, current in cur.fetchall():
                 audience = reference_audience(title)
-                cur.execute("UPDATE policies SET audience = %s WHERE id = %s", (audience, policy_id))
-                cur.execute("UPDATE policy_chunks SET audience = %s WHERE policy_id = %s", (audience, policy_id))
+                if audience != current:
+                    cur.execute("UPDATE policies SET audience = %s WHERE id = %s", (audience, policy_id))
+                    cur.execute("UPDATE policy_chunks SET audience = %s WHERE policy_id = %s", (audience, policy_id))
+                    converged = True
+            if converged:
+                cur.execute("DELETE FROM answer_cache")
 
     def ping(self) -> None:
         with self._lock, self.conn.cursor() as cur:

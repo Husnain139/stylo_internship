@@ -47,6 +47,9 @@ RRF_K = 60
 # Floor on the reranker score. 0 until the tuning set chooses it.
 RERANK_FLOOR = 0.0
 MIN_VECTOR_SCORE = 0.25
+# The closest meaning skips the word filter only when it leads the next passage by this much.
+# Measured: 0.083 for the clause that answers "Can I bring a lawyer?", at most 0.029 for unanswerable questions.
+VECTOR_LEAD = 0.05
 HISTORY_TURNS = 6
 PASSAGE_SCORE_WINDOW = 0.12
 MAX_PASSAGES = 4

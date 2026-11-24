@@ -13,6 +13,7 @@ from .config import (
     RETRIEVE_CANDIDATES,
     RETRIEVE_TOP_K,
     RRF_K,
+    VECTOR_LEAD,
 )
 from .clauses import asked_clause, asked_page, contains_clause, heading_naming, heading_phrases
 from .models import Passage
@@ -90,8 +91,10 @@ def search_passages(
     explicit = set(heading_order)
     pool_ids = {passage.id for passage in sorted(raw, key=lambda item: rrf.get(item.id, 0.0), reverse=True)[:20]}
     pool_ids.update(explicit)
-    # The word gate must not drop the closest meaning. "lawyer" is never in the clause that says "advocate".
-    best_vector = max((passage.vec_score for passage in raw), default=0.0)
+    # The word gate must not drop a clear closest meaning. "lawyer" is never in the clause that says "advocate".
+    by_meaning = sorted((passage.vec_score for passage in raw), reverse=True)
+    best_vector = by_meaning[0] if by_meaning else 0.0
+    clear_lead = best_vector > 0 and best_vector - (by_meaning[1] if len(by_meaning) > 1 else 0.0) >= VECTOR_LEAD
     kept: list[Passage] = []
     for passage in raw:
         if passage.id not in pool_ids:
@@ -101,7 +104,7 @@ def search_passages(
             passage.score += 0.02
         if asks_for_form and passage.content_type == "form":
             passage.score += 0.02
-        if passage.id in explicit or _keep(passage) or (best_vector > 0 and passage.vec_score >= best_vector):
+        if passage.id in explicit or _keep(passage) or (clear_lead and passage.vec_score >= best_vector):
             kept.append(passage)
     kept.sort(key=lambda passage: passage.score, reverse=True)
     # Only a heading named in full replaces the ranked list. Part of a title only lifts it in the fusion above.

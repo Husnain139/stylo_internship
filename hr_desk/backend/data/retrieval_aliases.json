@@ -90,6 +90,15 @@
       ]
     },
     {
+      "id": "advocate",
+      "match": "advocate",
+      "means": "advocate",
+      "aliases": [
+        {"phrase": "advocate", "source": "Corrective Action Policy 6.6: no advocate can legally assist a workman during the inquiry"},
+        {"phrase": "lawyer", "source": "judgment; everyday word for advocate"}
+      ]
+    },
+    {
       "id": "outstanding",
       "match": "outstanding pf loan",
       "means": "outstanding",

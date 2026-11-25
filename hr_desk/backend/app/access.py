@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-from .textutil import matched_tokens, token_set
+from .textutil import _stem, matched_tokens, token_set
 
 ROLE_LABELS = {
     "intern": "Intern",
@@ -277,14 +277,16 @@ _BROAD = {
     "this",
     "that",
     "about",
+    "new",
+    "long",
 }
 
 
 def asks_for_hidden(question: str, passages) -> bool:
     """A role refusal needs the question to actually name the closed passage.
 
-    A word in the title or heading is enough. A single ordinary word that only
-    appears in the body, such as password, is not.
+    A substantive word in the title or heading is enough. Body matches need
+    two distinct words (allowing inflections, but not fuzzy spelling matches).
     """
     words = {word for word in token_set(question) if len(word) >= 3 and word not in _BROAD}
     if not words:
@@ -292,7 +294,8 @@ def asks_for_hidden(question: str, passages) -> bool:
     for passage in passages:
         if matched_tokens(words, f"{getattr(passage, 'title', '')} {getattr(passage, 'heading', '')}"):
             return True
-        if len(matched_tokens(words, getattr(passage, "body", ""))) >= 2:
+        body_stems = {_stem(word) for word in token_set(getattr(passage, "body", ""))}
+        if len({_stem(word) for word in words} & body_stems) >= 2:
             return True
     return False
 

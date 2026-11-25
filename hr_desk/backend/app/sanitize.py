@@ -100,7 +100,8 @@ def fixed_reply(answer: str) -> str:
     plain = answer.strip(" \r\n\t.!*").replace("’", "'").casefold()
     if plain.startswith("i can't answer") and REFUSAL.casefold().startswith(plain):
         return REFUSAL
-    if ((plain.startswith("i couldn't find this") and UNKNOWN.casefold().startswith(plain))
+    unknown_text = re.sub(r"^[^:\n]+:\s+", "", plain)
+    if ((unknown_text.startswith("i couldn't find this") and UNKNOWN.casefold().startswith(unknown_text))
             or re.fullmatch(r"(?:[^:\n]+:\s+)?i couldn't find this(?:\.\s+ask(?: hr)?)?", plain)):
         return UNKNOWN
     return ""

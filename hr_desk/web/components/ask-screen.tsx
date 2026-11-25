@@ -211,7 +211,8 @@ export function AskScreen() {
         {historyOpen ? "Hide chat history" : "Show chat history"}
       </button>
       <aside id={historyId} className={`chat-sidebar${historyOpen ? " is-open" : ""}`} aria-label="Chat history">
-        <button className="primary" type="button" disabled={busy} onClick={() => void openChat("")}>New chat</button>
+        <div className="sidebar-heading"><span className="eyebrow">YOUR WORKSPACE</span><p>Conversations</p><span className="sidebar-subtitle">Your questions, all in one place.</span></div>
+        <button className="primary new-chat" type="button" disabled={busy} onClick={() => void openChat("")}><span aria-hidden="true">＋</span> New chat</button>
         <h2>Saved chats</h2>
         {historyError ? <p className="banner" role="status">{historyError}</p> : null}
         {!historyError && chats.length === 0 ? <p className="chat-sidebar-note">Your chats will appear here.</p> : null}
@@ -231,7 +232,11 @@ export function AskScreen() {
       </aside>
       <div className="stack employee-chat">
       <header className="page-head chat-heading">
-        <h1>Ask about a policy</h1>
+        <div className="chat-intro">
+          <span className="eyebrow"><span className="status-dot" aria-hidden="true" /> YOUR HR DESK</span>
+          <h1>Ask about a policy</h1>
+          <p className="lead">A little clarity for your workday. Ask a question to get started.</p>
+        </div>
         {chatId && !deleting ? <button type="button" disabled={busy} onClick={() => setDeleting(true)}>Delete chat</button> : null}
         {deleting ? (
           <div className="row-actions confirm" role="group" aria-label="Confirm chat deletion">
@@ -271,7 +276,25 @@ export function AskScreen() {
             </li>
           ) : null}
         </ol>
-      ) : null}
+      ) : (
+        <div className="chat-welcome">
+          <div className="welcome-mark" aria-hidden="true">✦</div>
+          <h2>How can we help today?</h2>
+          <p>Find your way through workplace policies, one question at a time.</p>
+          <div className="suggestions">
+            <h3>Start with a question</h3>
+            <ul className="people">
+              {[...GENERAL_SUGGESTIONS, ...(ADDITIONAL_SUGGESTIONS[me.designation] || []), "What is my fuel entitlement?"].map((item) => (
+                <li key={item}>
+                  <button type="button" disabled={busy} onClick={() => void submit(item)}>
+                    <span>{item}</span><span className="suggestion-arrow" aria-hidden="true">↗</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
       <div ref={threadEnd} />
       </div>
       <div className="chat-composer">
@@ -320,20 +343,7 @@ export function AskScreen() {
           </button>
         )}
       </form>
-      {turns.length === 0 ? (
-        <div className="suggestions">
-          <h2>Try asking</h2>
-          <ul className="people">
-            {[...GENERAL_SUGGESTIONS, ...(ADDITIONAL_SUGGESTIONS[me.designation] || []), "What is my fuel entitlement?"].map((item) => (
-              <li key={item}>
-                <button type="button" disabled={busy} onClick={() => void submit(item)}>
-                  {item}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      <p className="composer-note">Answers are based on the policies available to you. When in doubt, ask HR.</p>
       </div>
       </div>
     </section>

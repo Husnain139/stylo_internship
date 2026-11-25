@@ -30,6 +30,7 @@ _BENEFIT_TITLE = re.compile(
 _HEADINGS = ["eligibility", "scope", "applicability", "coverage", "purpose", "benefits"]
 # "medical policy" or "tell me about health" names only the topic, so it asks what the policy gives this role.
 _MEDICAL_TOPIC = "medical health insurance takaful"
+_POLICY_TOPICS = {"travel": "travel travelling traveling tour", "provident": "provident fund pf loan"}
 _TOPIC_FILLER = "policy policies tell about explain info information details overview show give my our plan cover coverage"
 _MEDICAL_SCHEDULE = "medical benefit schedule"
 _MEDICAL_CLAIMS = ["claims in case of panel", "claim in case of non-panel hospital"]  # The printed heading reads "Panel Hospital1".
@@ -124,6 +125,41 @@ def asks_for_medical_overview(question: str) -> bool:
     leftover = words - matched_tokens(words, vocabulary)
     return (bool(words) and bool(matched_tokens(words, _MEDICAL_TOPIC))
             and all(_one_swap(word, vocabulary.split()) for word in leftover))
+
+
+def asks_for_policy_overview(question: str) -> str:
+    words = token_set(question)
+    for name, topic in _POLICY_TOPICS.items():
+        vocabulary = f"{topic} {_TOPIC_FILLER}"
+        if words and matched_tokens(words, topic) and not (words - matched_tokens(words, vocabulary)):
+            return name
+    return ""
+
+
+def policy_overview(store, employee: Employee, today: date, topic: str) -> tuple[str, list[Passage]] | None:
+    """Summarize only visible, current sections and the employee's own travel rows."""
+    role = employee.designation
+    audiences = set(allowed_audiences(role))
+    policy = next((p for p in store.list_policies()
+                   if topic in p.title.casefold() and shares_audience(p.audience, audiences)), None)
+    if policy is None:
+        return None
+    headings = _TRAVEL_HEADINGS if topic == "travel" else ["eligibility", "entitlement", "installment"]
+    evidence = [p for p in store.heading_hits(headings, audiences, today, policy_ids=[policy.id])
+                if p.content_type in {"section", "table"} and shares_audience(p.audience, audiences)
+                and visible_passage(role, p)
+                and can_see_passage(role, p.title, p.heading, p.body, p.content_type, p.audience)
+                and not (topic == "travel" and role not in {"regional_sales_manager", "area_sales_manager", "hr"}
+                         and re.search(r"field[- ]based", p.heading, re.I))
+                and not contains_named_pay(f"{p.title}\n{p.body}") and not exposes_prompt(p.body)]
+    if not evidence:
+        return None
+    lines = []
+    for p in evidence[:6]:
+        heading = re.sub(r"\bannexures?\s+[a-z0-9]+\b\s*[:.-]?\s*", "", p.heading, flags=re.I).strip(" :")
+        body = re.sub(r"\bannexures?\s+[a-z0-9]+\b", "the policy", _clauses(p.body, 1), flags=re.I)
+        lines.append(f"- {heading}: {body}")
+    return (f"{policy.title}, for your designation ({role_label(role)}):\n\n" + "\n".join(lines), evidence[:6])
 
 
 def _one_swap(word: str, vocabulary: list[str]) -> bool:

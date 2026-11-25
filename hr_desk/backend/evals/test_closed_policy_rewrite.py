@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from app.models import ChunkDraft, Completion, Employee, PolicyDraft
+import pytest
+
+from app.access import asks_for_hidden
+from app.models import ChunkDraft, Completion, Employee, Passage, PolicyDraft
 from app.pipeline import Pipeline
+from app.replies import UNKNOWN
 from app.store_memory import MemoryStore
 
 TODAY = date(2026, 11, 24)
@@ -52,3 +56,29 @@ def test_a_question_about_the_closed_policy_is_still_refused():
         STORE_MANAGER, "How many days before travel must I submit the travel request form?")
     assert result.outcome == "refused", result.answer
     assert "7 days" not in result.answer
+
+
+@pytest.mark.parametrize("question,role,heading,body", [
+    ("What are the official office timings?", "intern", "11. Policy Effective Date",
+     "Name of Official. Designation: Chief Operating Officer."),
+    ("How long is the probation period for new employees?", "people_specialist", "6. Enrollment of New Employee",
+     "HR collects the Medical Insurance Enrollment Form from new employees at confirmation."),
+])
+def test_unrelated_or_candidate_does_not_trigger_closed_policy_refusal(question, role, heading, body):
+    hidden = Passage("medical:1", "medical", "Medical Insurance Policy", "Medical Insurance Policy, " + heading,
+                     heading, body, "general_manager,hr", TODAY, None)
+    assert not asks_for_hidden(question, [hidden])
+    pipeline = _pipeline("other")
+    pipeline.llm.rewrite.return_value = question
+    with patch("app.pipeline.search_passages", side_effect=lambda _s, _e, _q, audiences, _t, **_k:
+               [hidden] if "hr" in audiences else []):
+        result = pipeline.ask(Employee(f"{role}@example.com", role, role), question)
+    assert result.outcome == "dont_know"
+    assert result.answer == UNKNOWN
+
+
+def test_closed_policy_matching_keeps_substantive_matches():
+    hidden = Passage("travel:1", "travel", "Travel Policy", "Travel Policy, Authorization",
+                     "Authorization of Travel", TRAVEL, "general_manager,hr", TODAY, None)
+    assert asks_for_hidden("When should I submit the travel request form?", [hidden])
+    assert asks_for_hidden("How many days before travelling must the form be submitted?", [hidden])

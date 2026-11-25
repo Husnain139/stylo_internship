@@ -3,14 +3,22 @@
 import unittest
 
 from app.config import CANARY
-from app.replies import REFUSAL
-from app.sanitize import forbidden_output, sanitize
+from app.replies import REFUSAL, UNKNOWN
+from app.sanitize import fixed_reply, forbidden_output, sanitize
 
 CLAIMS = "In-patient claims at a non-panel hospital are submitted to HR with the In-Patient Claim Form."
 RATES = "Regional Sales Manager: Daily Tour Allowance Rs. 1,500. Area Sales Manager: Rs. 1,000."
 
 
 class OutputGuardTests(unittest.TestCase):
+    def test_labeled_unknown_is_canonical_but_mixed_answer_is_not(self):
+        for draft in ("Topic: I couldn't find this in the policies I can open. Ask HR.",
+                      "Travel policy: I couldn’t find this in the policies I can open."):
+            with self.subTest(draft=draft):
+                self.assertEqual(fixed_reply(draft), UNKNOWN)
+                self.assertEqual(sanitize(draft, []), UNKNOWN)
+        self.assertEqual(fixed_reply("The rate is 100.\n\nTopic: I couldn't find this. Ask HR."), "")
+
     def test_equivalent_evidence_hedges_are_restated_as_the_policy(self):
         cases = {
             "The policy text provided does not specify a time limit for non-panel claims.":

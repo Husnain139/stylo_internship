@@ -27,7 +27,8 @@ from .access import (
     shares_audience,
 )
 from .clauses import asked_clause, contains_clause, focus_clauses
-from .benefits import asks_for_benefit_overview, asks_for_medical_overview, benefit_overview, medical_overview
+from .benefits import (asks_for_benefit_overview, asks_for_medical_overview, asks_for_policy_overview,
+                       benefit_overview, medical_overview, policy_overview)
 from .config import (
     EVIDENCE_MAX_BYTES,
     MAX_PASSAGES,
@@ -311,6 +312,17 @@ class Pipeline:
                 answer, sources = overview
                 state.update(outcome="answered", answer=answer, search="heading-lookup",
                              history_note="medical-overview", rewritten_question=question.strip(),
+                             sections=list(dict.fromkeys(p.section_label for p in sources)),
+                             citations=[_citation(p) for p in sources],
+                             valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
+                return self._finish(employee, question, state, started)
+
+            overview_topic = asks_for_policy_overview(question)
+            overview = policy_overview(self.store, employee, today, overview_topic) if overview_topic else None
+            if overview:
+                answer, sources = overview
+                state.update(outcome="answered", answer=answer, search="heading-lookup",
+                             history_note="policy-overview", rewritten_question=question.strip(),
                              sections=list(dict.fromkeys(p.section_label for p in sources)),
                              citations=[_citation(p) for p in sources],
                              valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
@@ -1692,7 +1704,7 @@ def _joined_links(text: str) -> str:
         line = lines[index]
         if re.search(r"https?://\S+$", line) and index + 1 < len(lines):
             nxt = lines[index + 1].strip()
-            if nxt and " " not in nxt and not re.match(r"^\d", nxt):
+            if nxt and " " not in nxt and not re.match(r"^(?:\d|https?://)", nxt, re.I):
                 line = line.rstrip() + nxt
                 index += 1
         joined.append(line)

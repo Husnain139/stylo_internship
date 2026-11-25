@@ -34,6 +34,13 @@ def passage(id, body, content_type="section", allowed_roles=("general_manager",)
 
 
 class AnswerContractTests(unittest.TestCase):
+    def test_labeled_unknown_is_not_marked_answered(self):
+        pipeline = fixture_pipeline()
+        pipeline._personal_travel = Mock(return_value=("answered", f"Topic: {UNKNOWN}", []))
+        result = pipeline.ask(GM, "DA for me")
+        self.assertEqual(result.outcome, "dont_know")
+        self.assertEqual(result.answer, UNKNOWN)
+
     def test_placeholders_use_verified_context(self):
         with model_context(TODAY, "General Manager"):
             for prompt in (system_prompt(TODAY, "General Manager"), "Rewrite the question."):

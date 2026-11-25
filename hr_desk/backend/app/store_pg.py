@@ -646,14 +646,16 @@ class PostgresStore(PostgresOperations):
                            c.heading_path, c.content_type, c.page, c.image_path, c.polarity, c.allowed_roles
                     FROM policy_chunks c
                     JOIN policies p ON p.id = c.policy_id AND p.published
+                    CROSS JOIN (SELECT replace(plainto_tsquery('english', %s)::text, ' & ', ' | ')::tsquery AS terms) q
                     WHERE string_to_array(c.audience, ',') && %s::text[] AND %s = ANY(c.allowed_roles)
                       AND c.effective_from <= %s
                       AND (LEAST(c.effective_to, p.superseded_on - 1) IS NULL OR LEAST(c.effective_to, p.superseded_on - 1) >= %s)
-                      AND c.search_text @@ plainto_tsquery('english', %s)
+                      AND c.search_text @@ q.terms
                       AND (%s::text[] IS NULL OR c.policy_id = ANY(%s::text[]))
+                    ORDER BY ts_rank(c.search_text, q.terms) DESC, c.id
                     LIMIT %s
                     """,
-                    (vector, audience_list, query_role(audiences), today, today, query, policy_ids, policy_ids, limit),
+                    (vector, query, audience_list, query_role(audiences), today, today, policy_ids, policy_ids, limit),
                 )
                 for row in cur.fetchall():
                     rows[row[0]] = row

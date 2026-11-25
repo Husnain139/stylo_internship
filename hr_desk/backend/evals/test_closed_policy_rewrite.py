@@ -58,6 +58,22 @@ def test_a_question_about_the_closed_policy_is_still_refused():
     assert "7 days" not in result.answer
 
 
+def test_an_intern_asking_about_a_closed_travel_policy_gets_the_boundary():
+    with patch("app.pipeline.search_passages", return_value=[]):
+        result = _pipeline("other").ask(Employee("intern@example.com", "Intern", "intern"),
+                                        "Does the travel policy apply to interns?")
+    assert result.outcome == "refused"
+    assert "internship" in result.answer.casefold()
+
+
+def test_an_explicitly_opened_travel_policy_is_not_refused_by_the_boundary():
+    pipeline = _pipeline("other")
+    pipeline.store.policies["travel"].audience = "intern"
+    with patch("app.pipeline.search_passages", return_value=[]):
+        result = pipeline.ask(Employee("intern@example.com", "Intern", "intern"), "Does the travel policy apply to interns?")
+    assert result.outcome != "refused"
+
+
 @pytest.mark.parametrize("question,role,heading,body", [
     ("What are the official office timings?", "intern", "11. Policy Effective Date",
      "Name of Official. Designation: Chief Operating Officer."),

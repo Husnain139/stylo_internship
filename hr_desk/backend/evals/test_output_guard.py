@@ -11,6 +11,13 @@ RATES = "Regional Sales Manager: Daily Tour Allowance Rs. 1,500. Area Sales Mana
 
 
 class OutputGuardTests(unittest.TestCase):
+    def test_notice_referral_is_unknown_without_discarding_a_partial_answer(self):
+        draft = ("Notice period for resignation: You need to refer to your employment terms. "
+                 "The policy does not specify a general notice period for resignations. "
+                 "Please confirm your current contract or local statutory requirements, and I can outline the exact notice period and any exceptions.")
+        self.assertEqual(fixed_reply(draft), UNKNOWN)
+        self.assertEqual(fixed_reply("The policy does not specify a notice period, but requires written resignation."), "")
+
     def test_labeled_unknown_is_canonical_but_mixed_answer_is_not(self):
         for draft in ("Topic: I couldn't find this in the policies I can open. Ask HR.",
                       "Travel policy: I couldn’t find this in the policies I can open."):
@@ -18,6 +25,12 @@ class OutputGuardTests(unittest.TestCase):
                 self.assertEqual(fixed_reply(draft), UNKNOWN)
                 self.assertEqual(sanitize(draft, []), UNKNOWN)
         self.assertEqual(fixed_reply("The rate is 100.\n\nTopic: I couldn't find this. Ask HR."), "")
+
+    def test_labeled_missing_percentage_is_unknown_but_not_a_partial_answer(self):
+        draft = "PF deduction: I couldn't find this exact percentage in the policy. The policy covers loans but not the monthly contribution rate."
+        self.assertEqual(fixed_reply(draft), UNKNOWN)
+        mixed = "PF deduction: I couldn't find this exact percentage, but another limit is 75%."
+        self.assertEqual(fixed_reply(mixed), "")
 
     def test_equivalent_evidence_hedges_are_restated_as_the_policy(self):
         cases = {

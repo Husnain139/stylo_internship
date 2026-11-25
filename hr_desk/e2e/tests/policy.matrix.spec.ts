@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { expect, test } from "@playwright/test";
 import { askThread } from "../lib/ask";
 import { apiAs } from "../lib/personas";
+import { containsForbidden, missingExpectedFact, norm } from "../lib/matrix-rules.mjs";
 
 interface Case {
   id: string;
@@ -13,6 +14,7 @@ interface Case {
   accept_also?: string[];
   must_contain_any?: string[];
   must_not_contain?: string[];
+  must_not_match?: string[];
   source?: string;
   why?: string;
   confidence?: string;
@@ -24,7 +26,6 @@ const cases: (Case & { file: string })[] = files.flatMap((file) =>
 );
 
 // "1,500" and "1500" are the same figure; compare without separators or case.
-const norm = (text: string) => text.toLowerCase().replace(/(\d),(\d)/g, "$1$2").replace(/\s+/g, " ");
 
 mkdirSync("report/matrix", { recursive: true });
 
@@ -37,10 +38,11 @@ for (const item of cases) {
     const last = turns.at(-1)!;
     const answer = norm(last.answer);
     const allowed = [item.expect, ...(item.accept_also ?? [])];
-    const missing = item.expect === "answered" && item.must_contain_any?.length
-      ? !item.must_contain_any.some((want) => answer.includes(norm(want)))
-      : false;
-    const leaked = (item.must_not_contain ?? []).filter((bad) => answer.includes(norm(bad)));
+    const missing = missingExpectedFact(last.outcome, answer, item.must_contain_any);
+    const leaked = [
+      ...(item.must_not_contain ?? []).filter((bad) => containsForbidden(answer, bad)),
+      ...(item.must_not_match ?? []).filter((pattern) => new RegExp(pattern, "i").test(last.answer)),
+    ];
     const verdict = {
       ...item,
       turns,

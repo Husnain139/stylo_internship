@@ -4,7 +4,7 @@ import unittest
 from datetime import date
 from unittest.mock import Mock
 
-from app.access import AUDIENCES, passage_grades, reference_audience, role_reason
+from app.access import AUDIENCES, grade_band, passage_grades, reference_audience, role_reason
 from app.models import ChunkDraft, Employee, Passage, PolicyDraft
 from app.pipeline import Pipeline
 from app.store_memory import MemoryStore
@@ -56,6 +56,10 @@ def medical_pipeline():
 
 
 class HeadOfficeAudienceTests(unittest.TestCase):
+    def test_acknowledgment_is_not_a_dgm_grade_marker(self):
+        self.assertIsNone(grade_band("Acknowledgment Form: Employee Name: Employee ID: Signatures:"))
+        self.assertIn("intern", passage_grades("Acknowledgment Form", "Employee ID: Signature:", "table", "Code of Conduct"))
+
     def test_head_office_policies_open_to_every_head_office_grade(self):
         for title in (PF, ADVANCE):
             with self.subTest(title=title):

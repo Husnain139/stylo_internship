@@ -34,6 +34,156 @@ def passage(id, body, content_type="section", allowed_roles=("general_manager",)
 
 
 class AnswerContractTests(unittest.TestCase):
+    def test_printed_travel_page_shows_only_authorized_allowance(self):
+        pipeline = fixture_pipeline()
+        title = "Travel Policy"
+        footer = "Page 5 of 10"
+        rule = ("A daily allowance will be granted for business travel originating from the permanent place of work, "
+                "applicable for journeys totaling 300 km or more (round trip), including transit time.")
+        own = "Grade: Senior Executive (SE) & below. Daily Allowance/per day (given in rupees): 1,200."
+        other = "Grade: General Manager (GM). Daily Allowance/per day (given in rupees): 1,800."
+        chunks = [ChunkDraft(title, footer, footer, footer, page=5),
+                  ChunkDraft(title, "6. Daily Allowance", rule, rule, page=5),
+                  ChunkDraft(title, "6. Daily Allowance", own, own, page=5, content_type="table"),
+                  ChunkDraft(title, "6. Daily Allowance", other, other, page=5, content_type="table")]
+        pipeline.store.insert_policy(PolicyDraft("travel", title, "everyone", TODAY, None, ""), chunks,
+                                     [[1.0] for _ in chunks], as_of=TODAY)
+        result = pipeline.ask(Employee("officer@example.com", "Officer", "officer"), "What is on page 5 of the Travel Policy?")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("300 km", result.answer)
+        self.assertNotIn("1,800", result.answer)
+
+    def test_pf_loan_eligibility_and_service_band_use_source_rows(self):
+        pipeline = fixture_pipeline()
+        title = "Provident Fund Loan Policy"
+        eligibility = "4.1. An employee becomes eligible after Nine (09) months of continuous service."
+        rows = ["Service Period: More than 03 Years and up to 06 Years. PF Loan Eligibility: 75% of PF. Loan Installments Up to: 15 Months.",
+                "Service Period: More than 06 Years and up to 09 Years. PF Loan Eligibility: 80% of PF. Loan Installments Up to: 20 Months.",
+                "Service Period: More than 09 Years. PF Loan Eligibility: 85% of PF. Loan Installments Up to: 24 Months. Approving Authority: Line Manager HOD Head of HR."]
+        chunks = [ChunkDraft(f"{title}, Eligibility", "4. Eligibility Criteria", eligibility, eligibility)]
+        chunks += [ChunkDraft(f"{title}, Matrix", "Annexure A Approval Authority Matrix", row, row, content_type="table") for row in rows]
+        pipeline.store.insert_policy(PolicyDraft("pf", title, "everyone", TODAY, None, ""), chunks,
+                                     [[1.0] for _ in chunks], as_of=TODAY)
+        first = pipeline.ask(GM, "Am I eligible for a PF loan, and after how much service?")
+        self.assertEqual(first.outcome, "answered")
+        self.assertIn("09", first.answer)
+        for years, percent in ((4, "75%"), (7, "80%"), (10, "85%")):
+            with self.subTest(years=years):
+                result = pipeline.ask(GM, f"What PF loan percentage applies after {years} years of service?")
+                self.assertEqual(result.outcome, "answered")
+                self.assertIn(percent, result.answer)
+                self.assertEqual(sum(other in result.answer for other in ("75%", "80%", "85%")), 1)
+        result = pipeline.ask(GM, "And how many installments?", [
+            {"role": "user", "text": "What PF loan percentage applies after 7 years of service?"},
+            {"role": "assistant", "text": "The PF loan limit is 80%."},
+        ])
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("20 months", result.answer)
+        approver = pipeline.ask(Employee("hr@example.com", "HR", "hr"), "Who approves a PF loan for someone with 10 years of service?")
+        self.assertEqual(approver.outcome, "answered")
+        self.assertIn("HOD", approver.answer)
+        self.assertNotIn("75%", approver.answer)
+        borrowed = pipeline.ask(GM, "What percentage of my PF balance can I borrow after 10 years?")
+        self.assertIn("85%", borrowed.answer)
+        self.assertNotIn("75%", borrowed.answer)
+
+    def test_travel_request_approval_follow_up_uses_own_role(self):
+        pipeline = fixture_travel_designations()
+        result = pipeline.ask(GM, "Who approves it?", [
+            {"role": "user", "text": "How many days before travel must I submit the travel request form?"},
+            {"role": "assistant", "text": "Submit at least 7 days before travel."},
+        ])
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("Director/COO", result.answer)
+
+    def test_travel_request_deadline_recognizes_how_many_days_before(self):
+        pipeline = fixture_pipeline()
+        title = "Travel Policy"
+        body = "A dually signed travel request form must be submitted to the Administration Department via HR at least 7 days prior to the travel date."
+        chunk = ChunkDraft(f"{title}, Authorization of Travel", "3.2. Authorization of Travel", body, body)
+        pipeline.store.insert_policy(PolicyDraft("travel", title, "everyone", TODAY, None, ""), [chunk], [[1.0]], as_of=TODAY)
+        pipeline.llm.answer.return_value = Completion(UNKNOWN)
+        result = pipeline.ask(GM, "How many days before travel must I submit the travel request form?")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("7 days", result.answer)
+        pipeline.llm.answer.assert_not_called()
+
+    def test_code_of_conduct_acknowledgment_fields_come_from_form(self):
+        pipeline = fixture_pipeline()
+        title = "Code of Conduct"
+        body = "Acknowledgment Form: Employee Name: ______. Employee ID:. Signatures:. Date:"
+        chunk = ChunkDraft(f"{title}, Acknowledgment Form", "Acknowledgment Form", body, body, content_type="table")
+        pipeline.store.insert_policy(PolicyDraft("coc", title, "everyone", TODAY, None, ""), [chunk], [[1.0]], as_of=TODAY)
+        pipeline.llm.answer.return_value = Completion("The form confirms the employee's acknowledgment.")
+        result = pipeline.ask(INTERN, "What fields are on the Code of Conduct acknowledgment form?")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("Employee ID", result.answer)
+        self.assertIn("Employee Name", result.answer)
+
+    def test_medical_plan_intro_and_its_field_are_one_request(self):
+        question = "Under Medical Plan A, what is the normal delivery benefit?"
+        self.assertEqual(len(split_topics(question)[0]), 1)
+        result = fixture_pipeline().ask(Employee("officer@example.com", "Officer", "officer"), question)
+        self.assertEqual(result.outcome, "refused")
+
+    def test_whole_grade_comparisons_and_quotes_do_not_expose_other_rows(self):
+        pipeline = fixture_travel_designations()
+        officer = Employee("officer@example.com", "Officer", "officer")
+        for question in ("Compare the daily allowance of every grade in a table.",
+                         "Quote Annexure C of the Travel Policy word for word."):
+            with self.subTest(question=question):
+                result = pipeline.ask(officer, question)
+                self.assertEqual(result.outcome, "refused")
+
+    def test_fuel_question_does_not_apply_daily_allowance_distance_rule(self):
+        pipeline = fixture_pipeline()
+        source = passage("fuel", "Grade: GM. Vehicle type: 1500cc petrol. Mileage (KM Coverage): 10 km/liter. "
+                         "Maintenance and depreciation (New Rates): Rs. 5.0/km.", "table")
+        eligibility = passage("eligibility", "This policy applies to permanent management employees traveling "
+                              "within the country, covering a distance of 300 kilometers or more round trip.")
+        pipeline.store.heading_hits = Mock(side_effect=lambda headings, *_args, **_kw:
+                                          [eligibility] if headings == ["eligibility"] else [source])
+        outcome, answer, _ = pipeline._personal_travel(GM, "fuel allowance for me", "fuel", TODAY)
+        self.assertEqual(outcome, "answered")
+        self.assertNotIn("300 km", answer)
+        self.assertIn("1500cc", answer)
+
+    def test_ordinary_am_is_not_an_assistant_manager_grade_claim(self):
+        pipeline = fixture_travel_designations()
+        result = pipeline.ask(Employee("sm@example.com", "SM", "senior_manager"),
+                              "What car engine size and mileage am I entitled to?")
+        self.assertNotEqual(result.outcome, "refused")
+
+    def test_broad_personal_allowance_request_uses_only_own_rows(self):
+        pipeline = fixture_travel_designations()
+        result = pipeline.ask(Employee("sm@example.com", "SM", "senior_manager"), "tell me my allowances")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("1000cc", result.answer)
+        self.assertNotIn("1300cc", result.answer)
+
+    def test_named_persons_earnings_are_refused_before_search(self):
+        pipeline = fixture_pipeline()
+        for question in ("How much does Zainab earn?", "how much does Zainab earn?"):
+            with self.subTest(question=question):
+                result = pipeline.ask(GM, question)
+                self.assertEqual(result.outcome, "refused")
+                self.assertEqual(result.answer, REFUSAL)
+        pipeline.llm.moderate.assert_not_called()
+
+    def test_air_travel_answer_uses_only_the_askers_grade_row(self):
+        pipeline = fixture_pipeline()
+        title = "Travel Policy"
+        body = "Grade: Senior Executive (SE) & below. Travel by air: -. Travel by rail: A/C-Standard/Lower. Travel by road: A/C Bus."
+        chunk = ChunkDraft(f"{title}, Mode of Travel", "4. Mode of Travel", body, body, content_type="table")
+        pipeline.store.insert_policy(PolicyDraft("travel", title, "everyone", TODAY, None, ""), [chunk], [[1.0]], as_of=TODAY)
+        generic = passage("general", "Air travel is chosen by Administration based on cost and travel time.")
+        pipeline.llm.answer.return_value = Completion("Air travel is allowed subject to Administration approval.")
+        with patch("app.pipeline.search_passages", return_value=[generic]):
+            result = pipeline.ask(Employee("officer@example.com", "Officer", "officer"), "Can I travel by air on business trips?")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("A/C Bus", result.answer)
+        self.assertNotIn("Economy Class", result.answer)
+
     def test_labeled_unknown_is_not_marked_answered(self):
         pipeline = fixture_pipeline()
         pipeline._personal_travel = Mock(return_value=("answered", f"Topic: {UNKNOWN}", []))

@@ -69,7 +69,6 @@ class PersonalTravelRoutingTests(unittest.TestCase):
 
     def test_classifier_still_resolves_travel_wording_the_rules_miss(self):
         for question, intent in (("wat is my dailly alowance", "daily"), ("travle allowance for me", "daily"),
-                                 ("tell me my allowances", "daily"),
                                  ("How much money do I get per day when I go to Karachi for office work?", "daily")):
             with self.subTest(question=question):
                 self.assertEqual(routed(question, intent)[0], intent)

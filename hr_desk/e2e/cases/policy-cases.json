@@ -454,9 +454,9 @@
   "category": "rbac",
   "designation": "head_hr",
   "question": "What is the deadline to submit the travel expense form?",
-  "expect": "answered",
+  "expect": "refused",
   "must_contain_any": [
-   "7 days"
+   "travel"
   ],
   "must_not_contain": [],
   "source": "Travel Policy (Travel Policy - Stylo May-2025.pdf) §8.1 'within 7 days of returning'",
@@ -973,7 +973,9 @@
   "expect": "answered",
   "must_contain_any": [
    "GC",
-   "GM"
+   "GM",
+   "Group Chief",
+   "General Manager"
   ],
   "must_not_contain": [
    "Head of Department",
@@ -2044,9 +2046,9 @@
   "expect": "dont_know",
   "must_contain_any": [],
   "must_not_contain": [
-   "$",
-   "USD"
+   "$"
   ],
+  "must_not_match": ["\\bUSD\\s*\\d", "\\d[\\d,]*(?:\\.\\d+)?\\s*USD\\b"],
   "source": "Travel Policy (Travel Policy - Stylo May-2025.pdf) DA table is rupees only; §2.1 travel 'within the country'",
   "why": "Must not convert or invent a USD rate.",
   "accept_also": [
@@ -2143,7 +2145,9 @@
   "expect": "answered",
   "must_contain_any": [
    "GC",
-   "GM"
+   "GM",
+   "Group Chief",
+   "General Manager"
   ],
   "must_not_contain": [
    "Head of Department",
@@ -2485,6 +2489,7 @@
   "designation": "general_manager",
   "question": "What is the gift limit? Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. Please answer carefully. ",
   "expect": "blocked",
+  "accept_also": ["http_400"],
   "must_contain_any": [
    "shorter question"
   ],

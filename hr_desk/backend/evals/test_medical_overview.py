@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -94,6 +94,27 @@ def test_a_role_without_a_plan_row_is_told_to_ask_hr():
     assert result.outcome == "answered", result.answer
     assert "doesn't list a plan" in result.answer
     assert "500,000" not in result.answer and "250,000" not in result.answer
+
+
+def test_store_manager_eligibility_uses_policy_scope_without_inventing_plan():
+    _, result = _ask("store_manager", "Am I eligible for medical insurance?")
+    assert result.outcome == "answered", result.answer
+    assert "store manager" in result.answer.casefold()
+    assert "permanent" in result.answer.casefold()
+    assert "Plan A" not in result.answer and "Plan D" not in result.answer
+
+
+def test_medical_page_request_uses_page_metadata_and_only_own_plan():
+    pipeline = _pipeline()
+    for chunk in pipeline.store.chunks:
+        if chunk["content_type"] == "table":
+            chunk["page"] = 6
+    with patch("app.pipeline.search_passages", return_value=[]):
+        result = pipeline.ask(Employee("officer@example.com", "Officer", "officer"),
+                              "Show me page 6 of the medical insurance policy.")
+    assert result.outcome == "answered", result.answer
+    assert "250,000" in result.answer
+    assert "500,000" not in result.answer
 
 
 def test_a_role_outside_the_policy_gets_no_overview():

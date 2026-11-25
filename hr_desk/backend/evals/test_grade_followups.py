@@ -63,3 +63,19 @@ def test_hr_gets_the_hotel_row_for_the_grade_it_names():
     result = pipeline.ask(HR, "What is the hotel entitlement for a Senior Manager?")
     assert "Chalet Hotel" in result.answer, result.answer
     assert "Faran Hotel" not in result.answer, result.answer
+
+
+def test_hr_daily_allowance_follow_up_uses_new_named_grade_row():
+    pipeline = _pipeline()
+    rows = ["Grade: Senior Executive & below. Daily Allowance: 1,200.",
+            "Grade: DGM to GM. Daily Allowance: 1,800."]
+    chunks = [ChunkDraft("Travel Policy, Daily Allowance", "6. Daily Allowance", body, body, content_type="table")
+              for body in rows]
+    pipeline.store.insert_policy(PolicyDraft("travel", "Travel Policy", "everyone", TODAY, None, ""),
+                                 chunks, [[1.0], [1.0]], as_of=TODAY)
+    history = [{"role": "user", "text": "What is the daily allowance for Senior Executive & below?"},
+               {"role": "assistant", "text": "The daily allowance is 1,200."}]
+    result = pipeline.ask(HR, "And for DGM to GM?", history)
+    assert result.outcome == "answered", result.answer
+    assert "1,800" in result.answer
+    assert "1,200" not in result.answer

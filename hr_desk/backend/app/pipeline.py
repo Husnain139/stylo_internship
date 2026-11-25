@@ -26,7 +26,7 @@ from .access import (
     role_label,
     shares_audience,
 )
-from .clauses import asked_clause, contains_clause, focus_clauses
+from .clauses import asked_clause, asked_page, contains_clause, focus_clauses
 from .benefits import (asks_for_benefit_overview, asks_for_medical_overview, asks_for_policy_overview,
                        benefit_overview, medical_overview, policy_overview)
 from .config import (
@@ -83,7 +83,7 @@ _ENTITLEMENT = re.compile(
     r"eligib\w*|air|flights?|vehicle)\b",
     re.I,
 )
-_TRAVEL_DEADLINE = re.compile(r"\b(?:when|how (?:early|far in advance)|deadline)\b.*\btravel request form\b", re.I)
+_TRAVEL_DEADLINE = re.compile(r"\b(?:when|how (?:early|far in advance|many days before)|deadline)\b.*\btravel request form\b", re.I)
 _HOTEL_SCHEDULE = "annexure c"
 _RULE_REQUEST = re.compile(r"\b(?:policy|rules?)\b|\bhow\b[^?.!]{0,55}\b(?:work|works|apply|applies)\b", re.I)
 _TA = re.compile(r"\bTA\b", re.I)
@@ -196,7 +196,7 @@ class Pipeline:
             )
             fuel_question = re.search(r"\b(fuel|mileage)\b", question, re.I)
             requested_roles = None
-            if fuel_question:
+            if fuel_question and named_grades(question):
                 requested_roles = policy_row_roles("Fuel Entitlement", f"Grade: {question}")
             requested_plan = _medical_plan(question)
             medical_fields = _medical_fields(question)
@@ -206,7 +206,13 @@ class Pipeline:
             asked_before = next((turn.get("text") or "" for turn in reversed(history or [])
                                  if turn.get("role") == "user"), "")
             entitlement_topic = _ENTITLEMENT.search(question) or _ENTITLEMENT.search(asked_before)
-            if (requested_roles and employee.designation not in requested_roles | {"hr"}
+            all_grades = (_COMPARISON.search(question) and _ENTITLEMENT.search(question)
+                          and re.search(r"\b(?:every|all|other)\s+grades?\b", question, re.I))
+            whole_grade_table = (re.search(r"\bannexure\s+c\b", question, re.I)
+                                 and re.search(r"\btravel\b", question, re.I)
+                                 and re.search(r"\b(?:word for word|verbatim|entire|full)\b", question, re.I))
+            if ((employee.designation != "hr" and (all_grades or whole_grade_table))
+                    or requested_roles and employee.designation not in requested_roles | {"hr"}
                     or (entitlement_topic and names_other_grade(employee.designation, question))):
                 state["outcome"] = "refused"
                 state["answer"] = "I can't share an entitlement for a different grade. Ask HR if you need help."
@@ -285,6 +291,46 @@ class Pipeline:
                 state["guardrail_reason"] = "moderation"
                 state["outcome"] = "blocked"
                 state["answer"] = REFUSAL
+                return self._finish(employee, question, state, started)
+            if (employee.designation in {"intern", "trainee"} and re.search(r"\btravel policy\b", question, re.I)
+                    and re.search(r"\b(?:interns?|internship|trainees?)\b", question, re.I)
+                    and re.search(r"\b(?:appl(?:y|ies)|eligib\w*|cover\w*)\b", question, re.I)):
+                audiences = set(allowed_audiences(employee.designation))
+                policies = [p for p in self.store.list_policies() if p.title.casefold() == "travel policy"
+                            and not shares_audience(p.audience, audiences)]
+                if policies:
+                    state.update(outcome="refused", answer=role_reason(employee.designation, policies), withheld=True)
+                    return self._finish(employee, question, state, started)
+            exact = self._source_fact(employee, question, today)
+            if not exact and latest_answer and not unresolved and not fixed_reply(latest_answer.get("text", "")):
+                prior_question = next((turn.get("text", "") for turn in reversed(history) if turn.get("role") == "user"), "")
+                if re.fullmatch(r"(?:and\s+)?(?:how many|what (?:are|about))\s+installments?[?.!]*", question.strip(), re.I):
+                    exact = self._source_fact(employee, f"{prior_question} {question}", today)
+                elif (re.search(r"\bdental\b", question, re.I) and re.search(r"\b(?:it|that|this)\b", question, re.I)
+                      and re.search(r"\b(?:medical|health|takaful)\b", prior_question, re.I)):
+                    exact = self._source_fact(employee, f"{prior_question} {question}", today)
+                elif (employee.designation == "hr" and re.match(r"^\s*(?:and|what about)\b", question, re.I)
+                      and re.search(r"\b(?:daily allowance|per diem|DA)\b", prior_question, re.I)
+                      and (requested := named_grades(question))):
+                    audiences = set(allowed_audiences(employee.designation))
+                    rows = [p for p in self.store.heading_hits(["daily allowance"], audiences, today)
+                            if "travel" in p.title.casefold() and p.content_type == "table"
+                            and self._topic_visible(employee.designation, p, audiences)
+                            and requested <= (policy_row_roles(p.heading, p.body, p.title) or set())]
+                    if len(rows) == 1:
+                        exact = friendly_table(rows, question), rows
+                elif (re.fullmatch(r"who\s+(?:approves|authori[sz]es|signs)\s+(?:it|that|this)[?.!]*", question.strip(), re.I)
+                      and re.search(r"\btravel request form\b", prior_question, re.I)):
+                    outcome, answer, sources = self._personal_travel(employee, prior_question, "approval", today)
+                    if outcome == "answered":
+                        exact = answer, sources
+            if exact:
+                answer, sources = exact
+                state.update(outcome="answered", answer=answer, search="heading-lookup",
+                             rewritten_question=question.strip(),
+                             sections=list(dict.fromkeys(p.section_label for p in sources)),
+                             citations=[_citation(p) for p in sources],
+                             valid_until=min((p.effective_to for p in sources if p.effective_to), default=None))
                 return self._finish(employee, question, state, started)
             if _TRAVEL_DEADLINE.search(question):
                 audiences = set(allowed_audiences(employee.designation))
@@ -801,7 +847,8 @@ class Pipeline:
             named = _named_policy_scope(query, self.store)
             scope = {} if not named else {"policy_ids": named[1]}
             requested = (policy_row_roles("Medical Benefit Schedule", explicit[0]) if explicit else
-                         policy_row_roles("Fuel Entitlement", f"Grade: {query}") if kind == "fuel" else None)
+                         policy_row_roles("Fuel Entitlement", f"Grade: {query}")
+                         if kind == "fuel" and named_grades(query) else None)
             if requested and role not in requested | {"hr"}:
                 state["withheld"] = True
                 continue
@@ -957,6 +1004,197 @@ class Pipeline:
     def _topic_visible(role, passage, audiences):
         return shares_audience(passage.audience, audiences) and _visible(role, passage)
 
+    def _source_fact(self, employee, question, today):
+        audiences = set(allowed_audiences(employee.designation))
+        def policy_hits(title, heading):
+            return [p for p in self.store.heading_hits([heading], audiences, today)
+                    if title in p.title.casefold() and self._topic_visible(employee.designation, p, audiences)]
+
+        page = asked_page(question)
+        if page and re.search(r"\btravel policy\b", question, re.I):
+            rows = [p for p in self.store.printed_page_hits(page, audiences, today)
+                    if "travel" in p.title.casefold() and self._topic_visible(employee.designation, p, audiences)]
+            rules = [p for p in rows if p.content_type == "section" and _DA_CONDITION.search(p.body)]
+            if rules and len({p.policy_id for p in rows}) == 1:
+                distance = _DA_CONDITION.search(rules[0].body)[1]
+                return (f"The page includes the daily allowance rule for journeys totaling {distance} km or more round trip, including transit time.", [rules[0]])
+        if page and re.search(r"\b(?:medical|takaful|health insurance)\b", question, re.I):
+            rows = [p for p in policy_hits("medical", _MEDICAL_SCHEDULE)
+                    if p.page == page and p.content_type == "table"
+                    and (employee.designation == "hr" or employee.designation in
+                         (policy_row_roles(p.heading, p.body, p.title) or set()))]
+            if rows and len({p.policy_id for p in rows}) == 1:
+                return friendly_table(rows, question), rows
+        if re.fullmatch(r"(?:tell|show|list)(?:\s+me)?\s+my\s+allowances[?.!]*", question.strip(), re.I):
+            sections, sources = [], {}
+            for intent, label in (("daily", "Daily allowance"), ("hotel", "Hotel allowance"), ("fuel", "Fuel allowance")):
+                outcome, answer, evidence = self._personal_travel(employee, f"{label} for me", intent, today)
+                if outcome == "answered" and evidence:
+                    sections.append(f"{label}: {answer}")
+                    sources.update((p.id, p) for p in evidence)
+            if sections:
+                return "\n\n".join(sections), list(sources.values())
+        if (re.search(r"\b(?:minimum|lowest)\s+age\b", question, re.I)
+                and re.search(r"\b(?:hir\w*|employ\w*|recruit\w*)\b", question, re.I)):
+            for row in policy_hits("code of conduct", "gifts"):
+                match = re.search(r"child labou?r.{0,150}?not employ anyone under the age of\s+(\d+)", row.body, re.I | re.S)
+                if match:
+                    return f"The Code of Conduct says the company does not employ anyone under {match[1]} years of age.", [row]
+        if re.search(r"\bgifts?\b", question, re.I) and re.search(r"\b(?:accept\w*|supplier|hospitality)\b", question, re.I):
+            for row in policy_hits("code of conduct", "gifts"):
+                amount = re.search(r"not exceeding\s+PKR\s*([\d,]+)", row.body, re.I)
+                if amount and all(re.search(term, row.body, re.I) for term in (r"\bmodest\b", r"\binfrequent\b", r"\binfluence\b", r"\bmanager\b")):
+                    return (f"Gifts may only be accepted if they are modest (not exceeding PKR {amount[1]}), infrequent, and not intended to influence a business decision. Gifts must be reported to a manager.", [row])
+        if re.search(r"\bdental\b", question, re.I) and re.search(r"\b(?:medical|health|takaful)\b", question, re.I):
+            for row in policy_hits("medical", "medical exclusions"):
+                match = re.search(r"\bAny Dental Treatment\b[^.]*\baccidental injury\b[^.]*\.", row.body, re.I | re.S)
+                if match:
+                    clause = re.sub(r"\s+", " ", match[0]).strip()
+                    return f"The medical policy excludes: {clause}", [row]
+        if (re.search(r"\bnon[- ]panel\b", question, re.I) and re.search(r"\bclaim\b", question, re.I)
+                and re.search(r"\b(?:discharge|deadline|days|how long)\b", question, re.I)):
+            for row in policy_hits("medical", "in patient claim process"):
+                match = re.search(r"non[- ]panel hospital[^.]*within\s+(\d+)\s+days?\s+of\s+discharge", row.body, re.I | re.S)
+                if match:
+                    return f"Submit the original bills with the claim form within {match[1]} days of discharge.", [row]
+        if (re.search(r"\badvance\b", question, re.I) and re.search(r"\bcreate\b", question, re.I)
+                and re.search(r"\b(?:manager|approv\w*|submit\w*)\b", question, re.I)):
+            for row in policy_hits("advance salary", "enter required details"):
+                if (re.search(r"clicking\s*[“\"']?create[”\"']?\s+will save the request as draft", row.body, re.I)
+                        and re.search(r"create\s*&\s*submit", row.body, re.I)):
+                    return "Clicking Create saves the request as a draft; it is not sent for approval until you select Create & Submit.", [row]
+        if (re.search(r"\b(?:female|women|woman)\b", question, re.I) and re.search(r"\bair\b", question, re.I)
+                and re.search(r"\b(?:travel|fly|flight)\b", question, re.I)):
+            for row in policy_hits("travel", "mode of travel"):
+                if row.content_type == "section" and re.search(r"female employees not eligible for air travel.*lowest grade with air travel entitlement", row.body, re.I | re.S):
+                    return ("Female employees whose grade does not include air travel follow the policy for the lowest grade with air travel entitlement.", [row])
+        if re.search(r"\bsuspen(?:d|ded|sion)\b", question, re.I):
+            for row in policy_hits("corrective action", "suspension of service"):
+                days = re.search(r"(?:maximum|max(?:imum)? of)\s*(?:of\s*)?(\d+\s+working\s+days)", row.body, re.I)
+                half = re.search(r"\bhalf pay\b", row.body, re.I)
+                if days or half:
+                    details = []
+                    if days:
+                        details.append(f"The total suspension period must not exceed {days[1]}.")
+                    if half:
+                        details.append("Suspension days are paid at half pay.")
+                    return " ".join(details) + " Ask HR whether the rule applies to the employee's status.", [row]
+        if re.search(r"\bsmok\w*\b", question, re.I) and re.search(r"\bstock\s*room\b", question, re.I):
+            for row in policy_hits("corrective action", "progressive corrective action"):
+                if re.search(r"\bsmok\w*\b.*\bstock\s*room\b", row.body, re.I | re.S):
+                    return "Smoking in the stock room is listed as a violation subject to progressive corrective action.", [row]
+        if re.search(r"\bharass\w*\b", question, re.I) and re.search(r"\bcustomers?\b", question, re.I):
+            for row in policy_hits("corrective action", "immediate dismissal"):
+                if re.search(r"\bharassment\b.*\bcustomers?\b", row.body, re.I | re.S):
+                    return "Harassment of customers is listed as a violation that may be subject to immediate dismissal.", [row]
+        if (re.search(r"\b(?:salesman|salesmen)\b", question, re.I)
+                and re.search(r"\b(?:who|prepar\w*)\b", question, re.I)
+                and re.search(r"\bincident report\b", question, re.I)):
+            for row in policy_hits("corrective action", "authority on handling inquiry"):
+                if (row.content_type == "table" and re.search(r"\bsalesmen\s+and\s+below\b", row.body, re.I)
+                        and re.search(r"\bRSM to prepare Incident Report\b", row.body, re.I)):
+                    return "For cases involving salesmen and below, the RSM prepares the incident report.", [row]
+        if (re.search(r"\b(?:family|wife|husband|spouse)\b", question, re.I)
+                and re.search(r"\b(?:travel|trip)\b", question, re.I)):
+            for row in policy_hits("travel", "travel of family members"):
+                if re.search(r"\bown expense\b", row.body, re.I) and re.search(r"\bnot be liable\b", row.body, re.I):
+                    return ("Family members may travel at the employee's own expense; the company is not liable for their travel and related costs.", [row])
+        if (re.search(r"\b(?:daily allowance|per diem|DA)\b", question, re.I)
+                and re.search(r"\b(?:same[- ]day|hours?)\b", question, re.I)):
+            for row in policy_hits("travel", "daily allowance"):
+                if row.content_type != "section":
+                    continue
+                half = re.search(r"\bHalf DA\b[^.]*\b12 hours or less\b[^.]*\.", row.body, re.I)
+                if half:
+                    distance = _DA_CONDITION.search(row.body)
+                    text = half[0]
+                    if distance:
+                        text += f" The general daily allowance rule also requires a {distance[1]} km round trip."
+                    return text, [row]
+        if (_PERSONAL.search(question) and re.search(r"\bair\b", question, re.I)
+                and re.search(r"\b(?:travel|trips?|fly|flight)\b", question, re.I)
+                and not re.search(r"\b(?:female|women|woman|girl)\b", question, re.I)):
+            rows = [p for p in policy_hits("travel", "mode of travel") if p.content_type == "table"
+                    and employee.designation in (policy_row_roles(p.heading, p.body, p.title) or set())]
+            if len(rows) == 1:
+                fields = {key.casefold(): value for key, value in _fields(rows[0].body)}
+                air = fields.get("travel by air")
+                if air:
+                    text = ("No air travel entitlement is listed for your grade." if air == "-"
+                            else f"Your grade's listed air travel entitlement is {air}.")
+                    for key, label in (("travel by rail", "Rail"), ("travel by road", "Road")):
+                        if fields.get(key) and fields[key] != "-":
+                            text += f" {label}: {fields[key]}."
+                    exceptions = [p for p in policy_hits("travel", "mode of travel") if p.content_type == "section"
+                                  and re.search(r"female employees not eligible for air travel", p.body, re.I)]
+                    if exceptions and air == "-":
+                        text += " A separate rule applies to female employees; ask HR if it applies to you."
+                    return text, [*rows, *exceptions]
+        if (employee.designation in _RETAIL_MEDICAL_ROLES and _SELF_ELIGIBILITY.search(question)
+                and re.search(r"\b(?:medical|health|insurance|takaful)\b", question, re.I)
+                and not _medical_plan(question)):
+            rows = [p for p in self.store.heading_hits(["eligibility"], audiences, today)
+                    if "medical" in p.title.casefold() and p.content_type == "section"
+                    and self._topic_visible(employee.designation, p, audiences)]
+            for row in rows:
+                match = re.search(r"2\.1\.\s*(.*?)(?=\s*2\.2\.|$)", row.body, re.I | re.S)
+                if match and "store manager" in match[1].casefold():
+                    scope = re.sub(r"\s+", " ", match[1]).strip()
+                    return f"{scope} Ask HR to confirm your individual eligibility.", [row]
+        if (re.search(r"\bcode of conduct\b", question, re.I)
+                and re.search(r"\backnowledg(?:e)?ment\b", question, re.I)
+                and re.search(r"\b(?:form|fields|details|fill)\b", question, re.I)):
+            rows = [p for p in self.store.heading_hits(["acknowledgment"], audiences, today)
+                    if "code of conduct" in p.title.casefold() and p.content_type in {"form", "table"}
+                    and self._topic_visible(employee.designation, p, audiences)]
+            for row in rows:
+                fields = [label for pattern, label in (
+                    (r"\bemployee\s+name\s*:", "Employee Name"), (r"\bemployee\s+id\s*:", "Employee ID"),
+                    (r"\bsignatures?\s*:", "Signature"), (r"\bdate\s*:", "Date"),
+                ) if re.search(pattern, row.body, re.I)]
+                if len(fields) >= 2:
+                    return _field_list("Code of Conduct acknowledgment form", fields), [row]
+        if not (re.search(r"\b(?:pf|provident fund)\b", question, re.I) and re.search(r"\b(?:loan|borrow\w*)\b", question, re.I)):
+            return None
+        tenure = re.search(r"\b(\d{1,2})\s*(?:years?|yrs?)\b", question, re.I)
+        if tenure and re.search(r"\b(?:percent(?:age)?|how much|balance|installments?|approv\w*)\b", question, re.I):
+            years = int(tenure[1])
+            matches = []
+            for row in self.store.heading_hits(["approval authority matrix"], audiences, today):
+                if "provident fund" not in row.title.casefold() or row.content_type != "table" or not self._topic_visible(employee.designation, row, audiences):
+                    continue
+                period = re.search(r"Service Period:\s*([^.]*)", row.body, re.I)
+                if not period:
+                    continue
+                text = period[1]
+                lower = re.search(r"more than\s+(\d+)\s+years?", text, re.I)
+                upper = re.search(r"up to\s+(\d+)\s+years?", text, re.I)
+                minimum = re.search(r"minimum\s+(\d+)\s+months?", text, re.I)
+                if ((lower and years > int(lower[1]) or minimum and years * 12 >= int(minimum[1]))
+                        and (not upper or years <= int(upper[1]))):
+                    matches.append(row)
+            if len(matches) == 1:
+                row = matches[0]
+                percentage = re.search(r"PF Loan Eligibility:\s*([\d.]+%)", row.body, re.I)
+                installments = re.search(r"Loan Installments Up to:\s*(\d+)\s+Months?", row.body, re.I)
+                if percentage:
+                    text = f"For {years} years of service, the PF loan limit is {percentage[1]} of the PF balance."
+                    if installments:
+                        text += f" Repayment is up to {installments[1]} months."
+                    authority = re.search(r"Approving Authority:\s*([^.]*)", row.body, re.I)
+                    if authority and re.search(r"\bapprov\w*\b", question, re.I):
+                        text += f" Approving authority: {authority[1].strip()}."
+                    return text, [row]
+        if not tenure and re.search(r"\b(?:eligible|eligibility|how (?:many|much) (?:months?|service))\b", question, re.I) and not re.search(r"\b(?:percent(?:age)?|balance|installments?)\b", question, re.I):
+            rows = [p for p in self.store.heading_hits(["eligibility criteria"], audiences, today)
+                    if "provident fund" in p.title.casefold() and p.content_type == "section"
+                    and self._topic_visible(employee.designation, p, audiences)]
+            for row in rows:
+                match = re.search(r"at least\s+([^.]*?months?\s+of\s+continuous\s+service)", row.body, re.I)
+                if match:
+                    return f"A PF loan requires at least {match[1]} with the company, subject to the other policy conditions.", [row]
+        return None
+
     def _report_rows(self, query, role, audiences, today, scope):
         report = re.search(r"\b(?:incident report|(?:investigation )?summar[yt] report)\b", query, re.I)
         if not report or re.search(r"\b(?:compar\w*|versus|difference)\b", query, re.I):
@@ -1029,8 +1267,8 @@ class Pipeline:
             if not rows:
                 rules = [p for p in rows_for("company-maintained vehicles") if p.content_type == "section"
                          and "reimbursed for fuel expenses based on the mileage rate" in p.body.casefold()]
-                if rules and travel_condition:
-                    return ("answered", f"{travel_condition} Fuel is reimbursed at the mileage rate if you're "
+                if rules:
+                    return ("answered", "Fuel is reimbursed at the mileage rate if you're "
                             "using a company-maintained vehicle for business travel or have a vehicle allowance.\n\n"
                             f"{RATE_MISSING}", [*rules, *eligibility])
                 return "dont_know", UNKNOWN, []
@@ -1042,11 +1280,9 @@ class Pipeline:
             elif len(rows) > 1 and re.search(r"\b(?:one|single|exact)\s+rate\b|\b(?:rate|amount)\s+only\b", question, re.I):
                 return "clarification", "Which vehicle engine size should I use?", []
             intro = f"The policy lists these fuel rates for your designation ({role_label(role)}):"
-            if travel_condition:
-                intro = f"{travel_condition}\n\n{intro}"
             rates = _fuel_rates(rows, question)
             if len(rows) == 1 and re.search(r"\b(?:rates?|amount|how much)\b", question, re.I) and not _COMPARISON.search(question):
-                return "answered", f"{rates.removeprefix('- ').rstrip('.')}. {travel_condition}".strip(), [*rows, *eligibility]
+                return "answered", rates.removeprefix("- ").rstrip(".") + ".", [*rows, *eligibility]
             return "answered", f"{intro}\n\n{rates}", [*rows, *eligibility]
 
         if intent == "daily":

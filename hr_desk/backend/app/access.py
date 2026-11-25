@@ -248,7 +248,7 @@ def grade_band(text: str) -> str | None:
     if "all level" in folded or "all grade" in folded:
         return "all"
     for band, markers in _GRADE_BANDS:
-        if any(marker in folded for marker in markers):
+        if any(re.search(rf"(?<!\w){re.escape(marker)}(?!\w)", folded) for marker in markers):
             return band
     return None
 

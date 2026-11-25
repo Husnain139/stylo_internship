@@ -101,8 +101,18 @@ def fixed_reply(answer: str) -> str:
     if plain.startswith("i can't answer") and REFUSAL.casefold().startswith(plain):
         return REFUSAL
     unknown_text = re.sub(r"^[^:\n]+:\s+", "", plain)
+    if re.fullmatch(
+            r"you need to refer to your employment terms\.\s*"
+            r"the policy does not specify a general notice period for resignations\.\s*"
+            r"please confirm your current contract or local statutory requirements, and i can outline the exact notice period and any exceptions",
+            unknown_text):
+        return UNKNOWN
     if ((unknown_text.startswith("i couldn't find this") and UNKNOWN.casefold().startswith(unknown_text))
             or re.fullmatch(r"(?:[^:\n]+:\s+)?i couldn't find this(?:\.\s+ask(?: hr)?)?", plain)):
+        return UNKNOWN
+    if (re.match(r"i couldn't find (?:this|the) (?:exact )?percentage\b", unknown_text)
+            and not re.search(r"\d|\b(?:however|nevertheless|instead)\b|\bbut\b(?!\s+not\b)", unknown_text)
+            and not re.search(r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty)\s+(?:per\s*cent|percent)\b", unknown_text)):
         return UNKNOWN
     return ""
 

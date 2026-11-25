@@ -55,6 +55,8 @@ def topic_kind(text: str) -> str:
 
 def split_topics(question: str) -> tuple[list[Topic], bool]:
     parts = [part.strip(" \t,;.-") for part in _BOUNDARY.split(question) if part.strip(" \t,;.-")]
+    if len(parts) == 2 and re.fullmatch(r"(?:under|in|for)\s+(?:the\s+)?(?:medical\s+)?plan\s+[a-e]", parts[0], re.I):
+        return [Topic(question, question)], False
     if len(parts) == 1 and not _UNSPLIT.search(question):
         segments = _AND.split(parts[0])
         kinds = [topic_kind(part) for part in segments]

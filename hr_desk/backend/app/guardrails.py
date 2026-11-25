@@ -35,7 +35,7 @@ _PAY = (
 
 _NAMED_PAY = (
     re.compile(r"\b[A-Z][a-z]{2,}'s (salary|pay|compensation)\b(?!\s+(?:advance|policy|bands?))"),
-    re.compile(r"\bhow much does [A-Z][a-z]{2,} (earn|make|get paid)\b"),
+    re.compile(r"\b(?i:how much does) [A-Z][a-z]{2,} (?i:earn|make|get paid)\b"),
 )
 _CLAIMED_ACCESS = re.compile(
     r"\b(?:i(?: am|['’]m)|my designation is|act as|pretend (?:i am|to be))\s+(?:the\s+|an?\s+)?"

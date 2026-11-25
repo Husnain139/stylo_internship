@@ -34,6 +34,20 @@ def passage(id, body, content_type="section", allowed_roles=("general_manager",)
 
 
 class AnswerContractTests(unittest.TestCase):
+    def test_claim_form_names_use_both_authorized_policies(self):
+        pipeline = fixture_pipeline()
+        pipeline.llm.answer.return_value = Completion(UNKNOWN)
+        for policy_id, title, heading, body in [
+            ("travel", "Travel Policy", "8. Travel Expense Form", "Employees must complete the Travel Expense Form for reimbursement."),
+            ("medical", "Medical Insurance Policy", "5.2. Claim in case of Non-Panel Hospital", "The employee must complete the In-Patient Claim Form and attach required documentation."),
+        ]:
+            chunk = ChunkDraft(title, heading, body, body)
+            pipeline.store.insert_policy(PolicyDraft(policy_id, title, "everyone", TODAY, None, ""), [chunk], [[1.0]], as_of=TODAY)
+        result = pipeline.ask(Employee("officer@example.com", "Officer", "officer"), "Which forms do I need for a travel expense claim and for a non-panel hospital claim?")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("Travel Expense Form", result.answer)
+        self.assertIn("In-Patient Claim Form", result.answer)
+
     def test_missing_requested_quantity_can_include_related_information(self):
         cases = [
             ("What is the notice period if I resign?", "Please check your contract. The policy does not specify a fixed notice period."),

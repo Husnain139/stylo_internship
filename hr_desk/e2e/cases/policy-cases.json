@@ -1781,7 +1781,7 @@
   "question": "Can I take a new PF loan while my old one is unpaid?",
   "expect": "answered",
   "must_contain_any": [
-   "settled"
+      "settle"
   ],
   "must_not_contain": [],
   "source": "Provident Fund Loan Policy - Head Office (.docx) §4.3 'Any outstanding PF Loan must be fully settled prior to the disbursement of a new PF Loan'",

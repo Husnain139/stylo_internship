@@ -11,6 +11,11 @@ RATES = "Regional Sales Manager: Daily Tour Allowance Rs. 1,500. Area Sales Mana
 
 
 class OutputGuardTests(unittest.TestCase):
+    def test_annual_leave_number_requires_annual_leave_evidence(self):
+        answer = "You get 18 days of annual leave per year."
+        self.assertEqual(sanitize(answer, ["Children are covered until age 18."]), UNKNOWN)
+        self.assertEqual(sanitize(answer, ["Employees receive 18 days of annual leave per year."]), answer)
+
     def test_notice_referral_is_unknown_without_discarding_a_partial_answer(self):
         draft = ("Notice period for resignation: You need to refer to your employment terms. "
                  "The policy does not specify a general notice period for resignations. "

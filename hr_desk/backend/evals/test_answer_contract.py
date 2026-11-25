@@ -12,7 +12,7 @@ from app.config import CANARY
 from app.llm import IncompleteCompletion, OpenAIBackend
 from app.models import ChunkDraft, Completion, Employee, Passage, PolicyDraft
 from app.passages import _TRAVEL_PAGES
-from app.pipeline import Pipeline, _claim_form_fields, _strip_closing_offers, _summary_report_fields, _visible
+from app.pipeline import Pipeline, _claim_form_fields, _personal_travel_intent, _strip_closing_offers, _summary_report_fields, _visible
 from app.prompting import chat_system_prompt, grouped_user_message, model_context, system_prompt, user_message
 from app.replies import RATE_MISSING, REFUSAL, TOPIC_MISSING, UNKNOWN
 from app.rewrite import rewrite_question
@@ -102,6 +102,27 @@ class AnswerContractTests(unittest.TestCase):
         ])
         self.assertEqual(result.outcome, "answered")
         self.assertIn("Director/COO", result.answer)
+
+    def test_roman_urdu_allowance_uses_own_grade(self):
+        self.assertEqual(_personal_travel_intent("Mujhe business trip par kitna daily allowance milta hai?", False, None), "daily")
+        pipeline = fixture_pipeline()
+        row = "Grade: Senior Executive (SE) & below. Daily Allowance/per day (given in rupees): 1,200."
+        chunk = ChunkDraft("Travel Policy, Daily Allowance", "6. Daily Allowance", row, row, content_type="table")
+        pipeline.store.insert_policy(PolicyDraft("travel", "Travel Policy", "everyone", TODAY, None, ""), [chunk], [[1.0]], as_of=TODAY)
+        result = pipeline.ask(Employee("officer@example.com", "Officer", "officer"), "Mujhe business trip par kitna daily allowance milta hai?")
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("1,200", result.answer)
+        pipeline.llm.answer.assert_not_called()
+
+    def test_fuel_location_follow_up_names_source(self):
+        pipeline = fixture_travel_designations()
+        result = pipeline.ask(GM, "where to find it", [
+            {"role": "user", "text": "fuel entitlement for me"},
+            {"role": "assistant", "text": "Your fuel rate is Rs. 4.0 per km."},
+        ])
+        self.assertEqual(result.outcome, "answered")
+        self.assertIn("Fuel Entitlement", result.answer)
+        self.assertNotIn("couldn't find", result.answer)
 
     def test_travel_request_deadline_recognizes_how_many_days_before(self):
         pipeline = fixture_pipeline()

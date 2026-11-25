@@ -161,6 +161,11 @@ def sanitize(answer: str, passage_texts: list[str], allowed_numbers_from: str = 
             numbers = _numbers(sentence)
             if not numbers <= allowed_numbers:
                 continue
+            if (numbers and re.search(r"\bannual leave\b", sentence, re.I)
+                    and not any(re.search(r"\bannual leave\b", source_sentence, re.I)
+                                and numbers <= _numbers(source_sentence)
+                                for source in passage_texts for source_sentence in _sentences(source))):
+                return UNKNOWN
             if numbers and _MONEY.search(sentence):
                 grade = grade_band(sentence)
                 if not any(numbers <= values and (grade is None or grade == band) for band, values in evidence):

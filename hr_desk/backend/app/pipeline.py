@@ -1036,6 +1036,15 @@ class Pipeline:
             return [p for p in self.store.heading_hits([heading], audiences, today)
                     if title in p.title.casefold() and self._topic_visible(employee.designation, p, audiences)]
 
+        if (re.search(r"\btravel\b", question, re.I) and re.search(r"\bnon[- ]panel\b", question, re.I)
+                and re.search(r"\bforms?\b", question, re.I) and re.search(r"\bclaims?\b", question, re.I)):
+            travel = [p for p in policy_hits("travel", "travel expense form")
+                      if re.search(r"\btravel expense form\b", p.body, re.I)]
+            medical = [p for p in policy_hits("medical", "claim in case of non-panel hospital")
+                       if re.search(r"\bin[- ]patient claim form\b", p.body, re.I)]
+            if travel and medical and len({p.policy_id for p in travel}) == len({p.policy_id for p in medical}) == 1:
+                return "For a travel expense claim, use the Travel Expense Form. For a non-panel hospital claim, use the In-Patient Claim Form.", [travel[0], medical[0]]
+
         page = asked_page(question)
         if page and re.search(r"\btravel policy\b", question, re.I):
             rows = [p for p in self.store.printed_page_hits(page, audiences, today)

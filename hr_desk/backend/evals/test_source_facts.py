@@ -28,7 +28,8 @@ def test_source_lookup_does_not_bypass_policy_audience():
                                  "Will the company pay for my wife on a business trip?", TODAY) is None
 
 
-def test_dental_follow_up_keeps_the_prior_medical_policy():
+@pytest.mark.parametrize("prior_answer", ["The policy has medical exclusions.", UNKNOWN])
+def test_dental_follow_up_keeps_the_prior_medical_policy(prior_answer):
     store = MemoryStore()
     body = "5. Any Dental Treatment unless necessitated due to accidental injury occurring and up to the extent of pain relief."
     chunk = ChunkDraft("Medical Insurance Policy, Exclusions", "In-Patient Medical Exclusions", body, body)
@@ -38,7 +39,7 @@ def test_dental_follow_up_keeps_the_prior_medical_policy():
     llm.answer.return_value = Completion(UNKNOWN)
     embedder.embed.return_value = [[1.0]]
     history = [{"role": "user", "text": "What does the medical insurance policy exclude?"},
-               {"role": "assistant", "text": "The policy has medical exclusions."}]
+               {"role": "assistant", "text": prior_answer}]
     result = Pipeline(store, embedder, llm, today=lambda: TODAY).ask(Employee("officer@example.com", "Officer", "officer"),
                                                                       "Does it cover dental treatment?", history)
     assert result.outcome == "answered", result.answer

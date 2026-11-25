@@ -114,6 +114,25 @@ _DA_CONDITION = re.compile(
 )
 
 
+def _missing_requested_quantity(question: str, answer: str) -> bool:
+    """Recognize an explicit missing quantity without discarding related information."""
+    if re.search(r"\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|sixty|ninety)\s+(?:days?|weeks?|months?|years?|percent)\b", answer, re.I):
+        return False
+    if re.search(r"\bnotice period\b", question, re.I):
+        field = r"notice period"
+    elif re.search(r"\bmaternity\b", question, re.I) and re.search(r"\b(?:days?|how long)\b", question, re.I):
+        field = r"(?:paid\s+days|maternity\s+leave|leave\s+days|number of (?:paid )?days)"
+    elif (re.search(r"\b(?:provident fund|pf)\b", question, re.I)
+          and re.search(r"\b(?:deduct\w*|contribut\w*)\b", question, re.I)
+          and re.search(r"\b(?:percent(?:age)?|rate)\b", question, re.I)):
+        field = r"(?:percentage|deduction rate|contribution rate)"
+    else:
+        return False
+    negative = r"(?:does not|doesn't|is not|isn't|aren't|not|couldn't|cannot|can't|unavailable)"
+    text = answer.replace("’", "'")
+    return bool(re.search(rf"{negative}[^.\n]{{0,90}}\b{field}\b|\b{field}\b[^.\n]{{0,90}}{negative}", text, re.I))
+
+
 class Pipeline:
     def __init__(self, store, embedder, llm, today=None) -> None:
         self.store = store
@@ -1387,6 +1406,9 @@ class Pipeline:
         elif state["outcome"] not in {"blocked", "refused"} and (canonical := fixed_reply(state["answer"])):
             state.update(answer=canonical, outcome="refused" if canonical == REFUSAL else "dont_know",
                          citations=[], valid_until=None)
+        elif (state["outcome"] == "answered" and state["topic_count"] == 1
+              and _missing_requested_quantity(question, state["answer"])):
+            state["outcome"] = "dont_know"
         if state["outcome"] == "answered" and state["history_note"] != "question-recall":
             note = _edition_note(question, self.store.list_policies() if re.search(r"\b(?:19|20)\d{2}\b", question) else [])
             if note and note not in state["answer"]:

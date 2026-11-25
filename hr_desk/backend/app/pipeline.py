@@ -73,7 +73,7 @@ _MEDICAL_FIELDS = (
 _FOLLOW_FIELD = re.compile(r"^(?:(?:and|also)\b|(?:what|how)\s+about\b)", re.I)
 _SELF_ELIGIBILITY = re.compile(r"\b(?:i|my|me)\b.*\b(?:eligible|covered|qualify)\b|\b(?:eligible|covered|qualify)\b.*\b(?:i|my|me)\b", re.I)
 _RETAIL_MEDICAL_ROLES = {"senior_store_manager", "store_manager", "assistant_store_manager", "branch_accountant"}
-_PERSONAL = re.compile(r"\b(?:my|for me|for myself|am i|do i|can i|should i|as an?)\b", re.I)
+_PERSONAL = re.compile(r"\b(?:my|for me|for myself|am i|do i|can i|should i|as an?|mujhe)\b", re.I)
 _VEHICLE_CC = re.compile(r"\b(\d{2,4})\s*cc\b", re.I)
 _FUEL_SCHEDULE = "fuel entitlement list"
 _TRAVEL_APPROVAL = "authorization of travel"
@@ -304,7 +304,12 @@ class Pipeline:
             exact = self._source_fact(employee, question, today)
             if not exact and latest_answer and not unresolved and not fixed_reply(latest_answer.get("text", "")):
                 prior_question = next((turn.get("text", "") for turn in reversed(history) if turn.get("role") == "user"), "")
-                if re.fullmatch(r"(?:and\s+)?(?:how many|what (?:are|about))\s+installments?[?.!]*", question.strip(), re.I):
+                if (re.fullmatch(r"where (?:can i |to )?find (?:it|this|that)[?.!]*", question.strip(), re.I)
+                        and re.search(r"\bfuel\b", prior_question, re.I)):
+                    outcome, _, sources = self._personal_travel(employee, prior_question, "fuel", today)
+                    if outcome == "answered" and sources:
+                        exact = "You can find this in the Travel Policy under Fuel Entitlement.", sources
+                elif re.fullmatch(r"(?:and\s+)?(?:how many|what (?:are|about))\s+installments?[?.!]*", question.strip(), re.I):
                     exact = self._source_fact(employee, f"{prior_question} {question}", today)
                 elif (re.search(r"\bdental\b", question, re.I) and re.search(r"\b(?:it|that|this)\b", question, re.I)
                       and re.search(r"\b(?:medical|health|takaful)\b", prior_question, re.I)):
@@ -1045,6 +1050,11 @@ class Pipeline:
                 amount = re.search(r"not exceeding\s+PKR\s*([\d,]+)", row.body, re.I)
                 if amount and all(re.search(term, row.body, re.I) for term in (r"\bmodest\b", r"\binfrequent\b", r"\binfluence\b", r"\bmanager\b")):
                     return (f"Gifts may only be accepted if they are modest (not exceeding PKR {amount[1]}), infrequent, and not intended to influence a business decision. Gifts must be reported to a manager.", [row])
+        if re.search(r"\b(?:lawyer|advocate)\b", question, re.I) and re.search(r"\binquir\w*\b", question, re.I):
+            for row in policy_hits("corrective action", "inquiry process"):
+                match = re.search(r"\bNo advocate can legally be permitted to assist a workman during the inquiry\.", row.body, re.I)
+                if match:
+                    return f"The policy states: {match[0]} Ask HR how this applies to your situation.", [row]
         if re.search(r"\bdental\b", question, re.I) and re.search(r"\b(?:medical|health|takaful)\b", question, re.I):
             for row in policy_hits("medical", "medical exclusions"):
                 match = re.search(r"\bAny Dental Treatment\b[^.]*\baccidental injury\b[^.]*\.", row.body, re.I | re.S)

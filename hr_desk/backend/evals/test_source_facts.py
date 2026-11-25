@@ -65,6 +65,8 @@ def test_dental_follow_up_keeps_the_prior_medical_policy():
      "section", "What is the minimum age to hire someone?", "18"),
     ("Code of Conduct", "Gifts", "Gifts may only be accepted if they are modest (not exceeding PKR 25,000 in value), infrequent, and not intended to influence a business decision. All gifts must be reported to a manager.",
      "section", "Can I accept free travel tickets from a supplier as a gift?", "25,000"),
+    ("Corrective Action Policy", "6.6. Inquiry Process", "No advocate can legally be permitted to assist a workman during the inquiry.",
+     "section", "Can I bring a lawyer to my inquiry?", "advocate"),
     ("Travel Policy", "6. Daily Allowance", "Half DA is granted for same-day return trips if the work-related travel is 12 hours or less.",
      "section", "Do I get DA for a same-day trip of 10 hours?", "half da"),
     ("Corrective Action Policy", "6.4. Authority on handling Inquiry cases and recommend Corrective-Action",

@@ -110,7 +110,7 @@ def fixed_reply(answer: str) -> str:
     if ((unknown_text.startswith("i couldn't find this") and UNKNOWN.casefold().startswith(unknown_text))
             or re.fullmatch(r"(?:[^:\n]+:\s+)?i couldn't find this(?:\.\s+ask(?: hr)?)?", plain)):
         return UNKNOWN
-    if (re.match(r"i couldn't find (?:this|the) (?:exact )?percentage\b", unknown_text)
+    if (re.match(r"i couldn't find (?:this|the) (?:(?:exact|specific) )?percentage\b", unknown_text)
             and not re.search(r"\d|\b(?:however|nevertheless|instead)\b|\bbut\b(?!\s+not\b)", unknown_text)
             and not re.search(r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty)\s+(?:per\s*cent|percent)\b", unknown_text)):
         return UNKNOWN

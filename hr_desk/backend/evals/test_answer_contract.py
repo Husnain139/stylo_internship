@@ -12,7 +12,7 @@ from app.config import CANARY
 from app.llm import IncompleteCompletion, OpenAIBackend
 from app.models import ChunkDraft, Completion, Employee, Passage, PolicyDraft
 from app.passages import _TRAVEL_PAGES
-from app.pipeline import Pipeline, _claim_form_fields, _personal_travel_intent, _strip_closing_offers, _summary_report_fields, _visible
+from app.pipeline import Pipeline, _claim_form_fields, _missing_requested_quantity, _personal_travel_intent, _strip_closing_offers, _summary_report_fields, _visible
 from app.prompting import chat_system_prompt, grouped_user_message, model_context, system_prompt, user_message
 from app.replies import RATE_MISSING, REFUSAL, TOPIC_MISSING, UNKNOWN
 from app.rewrite import rewrite_question
@@ -34,6 +34,18 @@ def passage(id, body, content_type="section", allowed_roles=("general_manager",)
 
 
 class AnswerContractTests(unittest.TestCase):
+    def test_missing_requested_quantity_can_include_related_information(self):
+        cases = [
+            ("What is the notice period if I resign?", "Please check your contract. The policy does not specify a fixed notice period."),
+            ("How many days of paid maternity leave can I take?", "The exact number of paid days isn't specified here. Pregnancy care is covered up to the policy limit."),
+            ("What percentage of salary is deducted for the provident fund every month?", "The loan policy covers repayments but does not specify the monthly salary deduction rate."),
+        ]
+        for question, answer in cases:
+            with self.subTest(question=question):
+                self.assertTrue(_missing_requested_quantity(question, answer))
+        self.assertFalse(_missing_requested_quantity(cases[0][0], "The policy requires 30 days of notice, but doesn't specify the form."))
+        self.assertFalse(_missing_requested_quantity(cases[1][0], "The policy does not specify the form, but provides 90 days of maternity leave."))
+
     def test_printed_travel_page_shows_only_authorized_allowance(self):
         pipeline = fixture_pipeline()
         title = "Travel Policy"

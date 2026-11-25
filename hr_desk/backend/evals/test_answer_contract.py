@@ -86,6 +86,13 @@ class AnswerContractTests(unittest.TestCase):
         borrowed = pipeline.ask(GM, "What percentage of my PF balance can I borrow after 10 years?")
         self.assertIn("85%", borrowed.answer)
         self.assertNotIn("75%", borrowed.answer)
+        pipeline.llm.answer.return_value = Completion(UNKNOWN)
+        with patch("app.pipeline.search_passages", return_value=[]):
+            unspecified = pipeline.ask(GM, "How much provident fund loan can I take?")
+        self.assertEqual(unspecified.outcome, "answered")
+        self.assertIn("service", unspecified.answer.casefold())
+        self.assertIn("75%", unspecified.answer)
+        self.assertIn("85%", unspecified.answer)
 
     def test_travel_request_approval_follow_up_uses_own_role(self):
         pipeline = fixture_travel_designations()

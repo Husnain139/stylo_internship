@@ -31,6 +31,7 @@ class OutputGuardTests(unittest.TestCase):
         self.assertEqual(fixed_reply(draft), UNKNOWN)
         mixed = "PF deduction: I couldn't find this exact percentage, but another limit is 75%."
         self.assertEqual(fixed_reply(mixed), "")
+        self.assertEqual(fixed_reply("Provident Fund deduction percentage: I couldn't find this specific percentage in the policy. The PF policy covers loan deductions and repayment, but not the monthly contribution rate."), UNKNOWN)
 
     def test_equivalent_evidence_hedges_are_restated_as_the_policy(self):
         cases = {

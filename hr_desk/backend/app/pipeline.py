@@ -321,7 +321,9 @@ class Pipeline:
                     state.update(outcome="refused", answer=role_reason(employee.designation, policies), withheld=True)
                     return self._finish(employee, question, state, started)
             exact = self._source_fact(employee, question, today)
-            if not exact and latest_answer and not unresolved and not fixed_reply(latest_answer.get("text", "")):
+            prior_reply = fixed_reply(latest_answer.get("text", ""))
+            if (not exact and latest_answer and not unresolved
+                    and (not prior_reply or (prior_reply == UNKNOWN and re.search(r"\bdental\b", question, re.I)))):
                 prior_question = next((turn.get("text", "") for turn in reversed(history) if turn.get("role") == "user"), "")
                 if (re.fullmatch(r"where (?:can i |to )?find (?:it|this|that)[?.!]*", question.strip(), re.I)
                         and re.search(r"\bfuel\b", prior_question, re.I)):

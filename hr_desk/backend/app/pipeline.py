@@ -1157,6 +1157,19 @@ class Pipeline:
         if not (re.search(r"\b(?:pf|provident fund)\b", question, re.I) and re.search(r"\b(?:loan|borrow\w*)\b", question, re.I)):
             return None
         tenure = re.search(r"\b(\d{1,2})\s*(?:years?|yrs?)\b", question, re.I)
+        if not tenure and re.search(r"\bhow much\b", question, re.I):
+            rows = [p for p in self.store.heading_hits(["approval authority matrix"], audiences, today)
+                    if "provident fund" in p.title.casefold() and p.content_type == "table"
+                    and self._topic_visible(employee.designation, p, audiences)]
+            bands = []
+            for row in rows:
+                period = re.search(r"Service Period:\s*([^.]*)", row.body, re.I)
+                percentage = re.search(r"PF Loan Eligibility:\s*([\d.]+%)", row.body, re.I)
+                if period and percentage:
+                    bands.append((period[1].strip(), percentage[1], row))
+            if bands and len({row.policy_id for _, _, row in bands}) == 1:
+                summary = "; ".join(f"{period}: {percentage}" for period, percentage, _ in bands)
+                return f"The PF loan limit depends on your service period: {summary}. Ask HR which band applies to you.", [row for _, _, row in bands]
         if tenure and re.search(r"\b(?:percent(?:age)?|how much|balance|installments?|approv\w*)\b", question, re.I):
             years = int(tenure[1])
             matches = []
